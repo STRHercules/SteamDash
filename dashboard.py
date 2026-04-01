@@ -8,16 +8,21 @@ Settings stored in SQLite. Web-based setup wizard on first run.
 Supports multiple games.
 """
 
+import base64
 import json
 import time
 import threading
 import sqlite3
 import os
+import re
 import sys
+import html
+import hmac
+import hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import urlopen, Request
 from urllib.parse import urlparse, parse_qs, quote
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 VERSION = "1.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +36,22 @@ FINANCIAL_EMPTY_RESPONSE_WARNING = (
 )
 DEFAULT_TELEGRAM_CONFIG = {'enabled': False, 'bot_token': '', 'chat_ids': []}
 DEFAULT_DISCORD_CONFIG = {'enabled': False, 'webhook_urls': []}
+DEFAULT_DISCORD_UPDATES_CONFIG = {
+    'enabled': False,
+    'webhook_urls': [],
+    'mention_text': '',
+    'title_prefix': '',
+    'embed_color': '#66C0F4',
+    'include_excerpt': True,
+    'excerpt_length': 280,
+    'include_author': True,
+    'use_header_image': True,
+    'post_existing': False,
+    'check_interval_minutes': 15,
+    'max_posts_per_check': 3
+}
+DEFAULT_DASHBOARD_CONFIG = {'port': 8081, 'poll_interval': 300, 'language': 'en', 'theme': 'dark', 'accent': 'steam'}
+DEFAULT_DISCORD_DASHBOARD_AUTH = {'username': '', 'password_hash': '', 'salt': ''}
 
 # ========== DATABASE ==========
 
@@ -63,6 +84,23 @@ def init_db():
         app_id TEXT, timestamp TEXT, total_adds INTEGER, total_deletes INTEGER,
         total_purchases INTEGER, net_wishlists INTEGER
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS news_state (
+        app_id TEXT PRIMARY KEY, last_gid TEXT, last_posted_at INTEGER
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS discord_update_posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        app_id TEXT,
+        game_name TEXT,
+        news_gid TEXT,
+        news_url TEXT,
+        webhook_url TEXT,
+        message_id TEXT,
+        message_index INTEGER,
+        content TEXT,
+        embed_json TEXT,
+        created_at TEXT,
+        updated_at TEXT
+    )''')
     conn.commit()
     conn.close()
 
@@ -92,24 +130,158 @@ def has_settings():
     return get_setting('steam_api_key') is not None
 
 
+def merge_dict(defaults, value):
+    merged = dict(defaults)
+    if isinstance(value, dict):
+        merged.update(value)
+    return merged
+
+
+def normalize_webhook_urls(values):
+    if not isinstance(values, list):
+        return []
+    return [str(url).strip() for url in values if str(url).strip()]
+
+
+def normalize_embed_color(value, default='#66C0F4'):
+    color = str(value or '').strip().lstrip('#').upper()
+    if re.fullmatch(r'[0-9A-F]{6}', color):
+        return f'#{color}'
+    return default
+
+
+def normalize_telegram_config(config):
+    merged = merge_dict(DEFAULT_TELEGRAM_CONFIG, config)
+    merged['enabled'] = bool(merged.get('enabled'))
+    merged['bot_token'] = str(merged.get('bot_token', '')).strip()
+    chat_ids = merged.get('chat_ids', [])
+    if not isinstance(chat_ids, list):
+        chat_ids = []
+    merged['chat_ids'] = [str(chat_id).strip() for chat_id in chat_ids if str(chat_id).strip()]
+    return merged
+
+
+def normalize_discord_config(config):
+    merged = merge_dict(DEFAULT_DISCORD_CONFIG, config)
+    merged['enabled'] = bool(merged.get('enabled'))
+    merged['webhook_urls'] = normalize_webhook_urls(merged.get('webhook_urls'))
+    return merged
+
+
+def normalize_discord_updates_config(config):
+    merged = merge_dict(DEFAULT_DISCORD_UPDATES_CONFIG, config)
+    merged['enabled'] = bool(merged.get('enabled'))
+    merged['webhook_urls'] = normalize_webhook_urls(merged.get('webhook_urls'))
+    merged['mention_text'] = str(merged.get('mention_text', '')).strip()
+    merged['title_prefix'] = str(merged.get('title_prefix', '')).strip()
+    merged['embed_color'] = normalize_embed_color(merged.get('embed_color'))
+    merged['include_excerpt'] = bool(merged.get('include_excerpt'))
+    merged['excerpt_length'] = max(80, min(parse_int(merged.get('excerpt_length'), 280), 12000))
+    merged['include_author'] = bool(merged.get('include_author'))
+    merged['use_header_image'] = bool(merged.get('use_header_image'))
+    merged['post_existing'] = bool(merged.get('post_existing'))
+    merged['check_interval_minutes'] = max(5, min(parse_int(merged.get('check_interval_minutes'), 15), 1440))
+    merged['max_posts_per_check'] = max(1, min(parse_int(merged.get('max_posts_per_check'), 3), 10))
+    return merged
+
+
+def normalize_dashboard_config(config):
+    merged = merge_dict(DEFAULT_DASHBOARD_CONFIG, config)
+    merged['port'] = max(1024, min(parse_int(merged.get('port'), 8081), 65535))
+    merged['poll_interval'] = max(30, min(parse_int(merged.get('poll_interval'), 300), 86400))
+    merged['language'] = str(merged.get('language', 'en')).strip() or 'en'
+    merged['theme'] = str(merged.get('theme', 'dark')).strip() or 'dark'
+    merged['accent'] = str(merged.get('accent', 'steam')).strip() or 'steam'
+    return merged
+
+
+def hash_dashboard_password(password, salt):
+    return hashlib.sha256((str(salt or '') + str(password or '')).encode('utf-8')).hexdigest()
+
+
+def build_discord_dashboard_auth_config(config, existing=None):
+    incoming = merge_dict(DEFAULT_DISCORD_DASHBOARD_AUTH, config)
+    current = merge_dict(DEFAULT_DISCORD_DASHBOARD_AUTH, existing)
+    username = str(incoming.get('username', '')).strip()
+    password = str(incoming.get('password', '')).strip()
+
+    if not username:
+        return dict(DEFAULT_DISCORD_DASHBOARD_AUTH)
+
+    if password:
+        salt = os.urandom(16).hex()
+        return {
+            'username': username,
+            'password_hash': hash_dashboard_password(password, salt),
+            'salt': salt
+        }
+
+    if current.get('password_hash') and current.get('salt'):
+        return {
+            'username': username,
+            'password_hash': str(current.get('password_hash', '')),
+            'salt': str(current.get('salt', ''))
+        }
+
+    return {
+        'username': username,
+        'password_hash': '',
+        'salt': ''
+    }
+
+
+def sanitize_settings_for_ui(settings):
+    safe = dict(settings or {})
+    auth = merge_dict(DEFAULT_DISCORD_DASHBOARD_AUTH, safe.get('discord_dashboard_auth', {}))
+    safe['discord_dashboard_auth'] = {
+        'username': str(auth.get('username', '')).strip(),
+        'has_password': bool(auth.get('password_hash') and auth.get('salt'))
+    }
+    return safe
+
+
+def discord_dashboard_auth_configured(auth_config):
+    auth = merge_dict(DEFAULT_DISCORD_DASHBOARD_AUTH, auth_config)
+    return bool(auth.get('username') and auth.get('password_hash') and auth.get('salt'))
+
+
+def verify_discord_dashboard_auth(auth_config, username, password):
+    auth = merge_dict(DEFAULT_DISCORD_DASHBOARD_AUTH, auth_config)
+    if not discord_dashboard_auth_configured(auth):
+        return False
+    if str(username or '') != str(auth.get('username', '')):
+        return False
+    expected = str(auth.get('password_hash', ''))
+    actual = hash_dashboard_password(password or '', auth.get('salt', ''))
+    return hmac.compare_digest(actual, expected)
+
+
 def get_all_settings():
     return {
         'steam_api_key': get_setting('steam_api_key', ''),
         'steam_financial_key': get_setting('steam_financial_key', ''),
         'games': get_setting('games', []),
-        'telegram': get_setting('telegram', DEFAULT_TELEGRAM_CONFIG),
-        'discord': get_setting('discord', DEFAULT_DISCORD_CONFIG),
-        'dashboard': get_setting('dashboard', {'port': 8081, 'poll_interval': 300, 'language': 'en', 'theme': 'dark', 'accent': 'steam'}),
+        'telegram': normalize_telegram_config(get_setting('telegram', DEFAULT_TELEGRAM_CONFIG)),
+        'discord': normalize_discord_config(get_setting('discord', DEFAULT_DISCORD_CONFIG)),
+        'discord_updates': normalize_discord_updates_config(get_setting('discord_updates', DEFAULT_DISCORD_UPDATES_CONFIG)),
+        'discord_dashboard_auth': merge_dict(DEFAULT_DISCORD_DASHBOARD_AUTH, get_setting('discord_dashboard_auth', DEFAULT_DISCORD_DASHBOARD_AUTH)),
+        'dashboard': normalize_dashboard_config(get_setting('dashboard', DEFAULT_DASHBOARD_CONFIG)),
     }
 
 
 def save_all_settings(data):
+    existing = get_all_settings()
     set_setting('steam_api_key', data.get('steam_api_key', ''))
     set_setting('steam_financial_key', data.get('steam_financial_key', ''))
     set_setting('games', data.get('games', []))
-    set_setting('telegram', data.get('telegram', DEFAULT_TELEGRAM_CONFIG))
-    set_setting('discord', data.get('discord', DEFAULT_DISCORD_CONFIG))
-    set_setting('dashboard', data.get('dashboard', {'port': 8081, 'poll_interval': 300, 'language': 'en', 'theme': 'dark', 'accent': 'steam'}))
+    set_setting('telegram', normalize_telegram_config(data.get('telegram', DEFAULT_TELEGRAM_CONFIG)))
+    set_setting('discord', normalize_discord_config(data.get('discord', DEFAULT_DISCORD_CONFIG)))
+    set_setting('discord_updates', normalize_discord_updates_config(data.get('discord_updates', DEFAULT_DISCORD_UPDATES_CONFIG)))
+    set_setting('discord_dashboard_auth', build_discord_dashboard_auth_config(
+        data.get('discord_dashboard_auth', DEFAULT_DISCORD_DASHBOARD_AUTH),
+        existing.get('discord_dashboard_auth', DEFAULT_DISCORD_DASHBOARD_AUTH)
+    ))
+    set_setting('dashboard', normalize_dashboard_config(data.get('dashboard', DEFAULT_DASHBOARD_CONFIG)))
 
 
 def parse_int(value, default=0):
@@ -221,6 +393,131 @@ def get_sales_totals(app_id):
     return row
 
 
+def get_news_state(app_id):
+    conn = get_conn()
+    row = conn.execute("SELECT last_gid, last_posted_at FROM news_state WHERE app_id=?", (str(app_id),)).fetchone()
+    conn.close()
+    if not row:
+        return {"last_gid": "", "last_posted_at": 0}
+    return {"last_gid": str(row[0] or ""), "last_posted_at": parse_int(row[1], 0)}
+
+
+def set_news_state(app_id, gid, posted_at=0):
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO news_state VALUES (?, ?, ?)",
+        (str(app_id), str(gid or ''), parse_int(posted_at, 0))
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_discord_update_post(app_id, game_name, news_gid, news_url, webhook_url, message_id, message_index, content, embed):
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    conn.execute(
+        """INSERT INTO discord_update_posts
+           (app_id, game_name, news_gid, news_url, webhook_url, message_id, message_index, content, embed_json, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            str(app_id),
+            str(game_name or ''),
+            str(news_gid or ''),
+            str(news_url or ''),
+            str(webhook_url or ''),
+            str(message_id or ''),
+            parse_int(message_index, 1),
+            str(content or ''),
+            json.dumps(embed or {}, ensure_ascii=False),
+            now,
+            now
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_discord_update_posts(limit=100):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT id, app_id, game_name, news_gid, news_url, webhook_url, message_id, message_index, content, embed_json, created_at, updated_at
+           FROM discord_update_posts
+           ORDER BY created_at DESC, message_index ASC
+           LIMIT ?""",
+        (parse_int(limit, 100),)
+    ).fetchall()
+    conn.close()
+    result = []
+    for row in rows:
+        try:
+            embed = json.loads(row[9]) if row[9] else {}
+        except (TypeError, json.JSONDecodeError):
+            embed = {}
+        result.append({
+            "id": row[0],
+            "app_id": row[1],
+            "game_name": row[2],
+            "news_gid": row[3],
+            "news_url": row[4],
+            "webhook_url": row[5],
+            "message_id": row[6],
+            "message_index": row[7],
+            "content": row[8] or '',
+            "embed": embed,
+            "created_at": row[10],
+            "updated_at": row[11],
+        })
+    return result
+
+
+def get_discord_update_post(post_id):
+    conn = get_conn()
+    row = conn.execute(
+        """SELECT id, app_id, game_name, news_gid, news_url, webhook_url, message_id, message_index, content, embed_json, created_at, updated_at
+           FROM discord_update_posts WHERE id=?""",
+        (parse_int(post_id, 0),)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    try:
+        embed = json.loads(row[9]) if row[9] else {}
+    except (TypeError, json.JSONDecodeError):
+        embed = {}
+    return {
+        "id": row[0],
+        "app_id": row[1],
+        "game_name": row[2],
+        "news_gid": row[3],
+        "news_url": row[4],
+        "webhook_url": row[5],
+        "message_id": row[6],
+        "message_index": row[7],
+        "content": row[8] or '',
+        "embed": embed,
+        "created_at": row[10],
+        "updated_at": row[11],
+    }
+
+
+def update_discord_update_post(post_id, content, embed):
+    now = datetime.now().isoformat()
+    conn = get_conn()
+    conn.execute(
+        "UPDATE discord_update_posts SET content=?, embed_json=?, updated_at=? WHERE id=?",
+        (str(content or ''), json.dumps(embed or {}, ensure_ascii=False), now, parse_int(post_id, 0))
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_discord_update_post(post_id):
+    conn = get_conn()
+    conn.execute("DELETE FROM discord_update_posts WHERE id=?", (parse_int(post_id, 0),))
+    conn.commit()
+    conn.close()
+
+
 # ========== HTTP FETCH WITH BACKOFF ==========
 
 _api_fail_counts = {}
@@ -255,6 +552,31 @@ def post_json(url, payload, label="api_post"):
             }
         )
         with urlopen(req, timeout=10) as resp:
+            raw = resp.read().decode().strip()
+        _api_fail_counts[label] = 0
+        return json.loads(raw) if raw else {}
+    except Exception as e:
+        count = _api_fail_counts.get(label, 0) + 1
+        _api_fail_counts[label] = count
+        wait = min(2 ** count, 60)
+        print(f"  [ERROR] {label}: {e} (backoff {wait}s)")
+        time.sleep(wait)
+        return None
+
+
+def send_json(url, payload, label="api_send", method="POST"):
+    global _api_fail_counts
+    try:
+        req = Request(
+            url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={
+                "User-Agent": "SteamDashboard/1.0",
+                "Content-Type": "application/json"
+            },
+            method=method
+        )
+        with urlopen(req, timeout=15) as resp:
             raw = resp.read().decode().strip()
         _api_fail_counts[label] = 0
         return json.loads(raw) if raw else {}
@@ -311,6 +633,177 @@ def get_recent_reviews(app_id):
     if data and data.get("success") == 1:
         return data.get("reviews", [])
     return []
+
+
+def fetch_steam_news(app_id, count=100):
+    data = fetch_json(
+        f"https://api.steampowered.com/ISteamNews/GetNewsForApp/v0002/?appid={app_id}&count={count}&maxlength=12000&format=json",
+        f"news_{app_id}"
+    )
+    if data and "appnews" in data:
+        return data["appnews"].get("newsitems", [])
+    return []
+
+
+def clean_steam_news_text(value):
+    text = html.unescape(str(value or ''))
+    text = re.sub(r'\r\n?', '\n', text)
+    text = re.sub(r'(?i)<br\s*/?>', '\n', text)
+    text = re.sub(r'(?i)</(?:p|div|section|article|ul|ol|blockquote)>', '\n\n', text)
+    text = re.sub(r'(?i)<(?:p|div|section|article|ul|ol|blockquote)[^>]*>', '\n', text)
+    text = re.sub(r'(?i)<li[^>]*>', '\n* ', text)
+    text = re.sub(r'(?i)</li>', '\n', text)
+    text = re.sub(r'(?i)<h[1-6][^>]*>', '\n\n', text)
+    text = re.sub(r'(?i)</h[1-6]>', '\n', text)
+
+    text = re.sub(r'\[url=[^\]]+\](.*?)\[/url\]', r'\1', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'\[(?:img|previewyoutube)[^\]]*\].*?\[/(?:img|previewyoutube)\]', ' ', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'\[h[1-6][^\]]*\](.*?)\[/h[1-6]\]', lambda m: f"\n\n{m.group(1).strip()}\n", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'\[b[^\]]*\](.*?)\[/b\]', lambda m: f"**{m.group(1).strip()}**", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'\[i[^\]]*\](.*?)\[/i\]', lambda m: f"*{m.group(1).strip()}*", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'\[u[^\]]*\](.*?)\[/u\]', lambda m: f"__{m.group(1).strip()}__", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'\[list[^\]]*\]', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[/list\]', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[\*\]', '\n* ', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[/?(?:quote|code)[^\]]*\]', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+
+    # Steam sometimes delivers community announcements already flattened into:
+    # "v0.9.x * bullet * bullet v0.10.x * bullet ..."
+    text = re.sub(r'(?<!^)(?<!\n)(\b[vV]\d+(?:\.\d+)*(?:\.x)?\b)(?=\s+\*)', r'\n\n\1', text)
+    text = re.sub(r'\s+\*\s+', '\n* ', text)
+    text = re.sub(r'(?<!\n)\*\s+', '\n* ', text)
+
+    lines = []
+    for raw_line in text.split('\n'):
+        line = raw_line.strip()
+        if not line:
+            if lines and lines[-1] != '':
+                lines.append('')
+            continue
+        line = re.sub(r'\s+([,.;:!?])', r'\1', line)
+        if re.fullmatch(r'v?\d[\w.\- ]*x?', line, flags=re.IGNORECASE):
+            line = f"**{line}**"
+        lines.append(line)
+
+    cleaned = '\n'.join(lines).strip()
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned
+
+
+def truncate_text_preserving_format(value, limit):
+    text = str(value or '').strip()
+    if len(text) <= limit:
+        return text
+
+    blocks = text.split('\n\n')
+    kept = []
+    current_len = 0
+    for block in blocks:
+        addition = len(block) if not kept else len(block) + 2
+        if current_len + addition > limit:
+            break
+        kept.append(block)
+        current_len += addition
+
+    if kept:
+        truncated = '\n\n'.join(kept).rstrip()
+        if len(truncated) < len(text):
+            return truncated + '\n…'
+
+    clipped = text[:max(0, limit - 1)].rstrip()
+    last_newline = clipped.rfind('\n')
+    if last_newline >= max(0, len(clipped) - 220):
+        clipped = clipped[:last_newline].rstrip()
+    elif ' ' in clipped:
+        clipped = clipped.rsplit(' ', 1)[0].rstrip()
+    return clipped + '…'
+
+
+def truncate_text(value, limit):
+    text = str(value or '').strip()
+    if len(text) <= limit:
+        return text
+    clipped = text[:max(0, limit - 1)].rstrip()
+    if ' ' in clipped:
+        clipped = clipped.rsplit(' ', 1)[0]
+    return clipped.rstrip('.,;: ') + '…'
+
+
+def split_text_preserving_format(value, limit):
+    text = str(value or '').strip()
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    paragraphs = text.split('\n\n')
+    current = ''
+
+    def push_current():
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+            current = ''
+
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+
+        candidate = paragraph if not current else current + '\n\n' + paragraph
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        push_current()
+
+        if len(paragraph) <= limit:
+            current = paragraph
+            continue
+
+        lines = paragraph.split('\n')
+        line_buffer = ''
+        for line in lines:
+            line = line.rstrip()
+            candidate = line if not line_buffer else line_buffer + '\n' + line
+            if len(candidate) <= limit:
+                line_buffer = candidate
+                continue
+
+            if line_buffer:
+                chunks.append(line_buffer.strip())
+                line_buffer = ''
+
+            if len(line) <= limit:
+                line_buffer = line
+                continue
+
+            words = line.split(' ')
+            word_buffer = ''
+            for word in words:
+                candidate = word if not word_buffer else word_buffer + ' ' + word
+                if len(candidate) <= limit:
+                    word_buffer = candidate
+                else:
+                    if word_buffer:
+                        chunks.append(word_buffer.strip())
+                    word_buffer = word
+            if word_buffer:
+                line_buffer = word_buffer
+
+        if line_buffer:
+            current = line_buffer.strip()
+
+    push_current()
+    return chunks
+
+
+def extract_version_from_news_title(title):
+    match = re.search(r'\b(v\d+(?:\.\d+)+(?:[a-z0-9\-\.]*)?)\b', str(title or ''), flags=re.IGNORECASE)
+    return match.group(1) if match else ''
 
 
 # ========== FINANCIAL API ==========
@@ -504,6 +997,14 @@ def discord_enabled(dc_config):
     return bool(dc_config.get('enabled') and dc_config.get('webhook_urls'))
 
 
+def discord_updates_ready(news_config):
+    return bool(news_config.get('webhook_urls'))
+
+
+def discord_updates_enabled(news_config):
+    return bool(news_config.get('enabled') and discord_updates_ready(news_config))
+
+
 def send_telegram(tg_config, message):
     if not telegram_enabled(tg_config):
         return
@@ -522,7 +1023,7 @@ def build_discord_embed(app_id, game_name, title, description="", color=0x66C0F4
         "title": title,
         "description": description,
         "color": color,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "footer": {"text": footer or f"Steam Dashboard - App {app_id}"},
         "url": f"https://store.steampowered.com/app/{app_id}/"
     }
@@ -532,6 +1033,55 @@ def build_discord_embed(app_id, game_name, title, description="", color=0x66C0F4
             for name, value, inline in fields
         ]
     return embed
+
+
+def build_discord_news_embeds(app_id, game_name, news_item, news_config, app_details=None):
+    title_prefix = str(news_config.get('title_prefix', '')).strip()
+    raw_title = str(news_item.get('title') or f"{game_name} Steam update").strip()
+    title = raw_title
+    if title_prefix:
+        title = f"{title_prefix} {title}"
+    version = extract_version_from_news_title(raw_title)
+
+    excerpt = clean_steam_news_text(news_item.get('contents', ''))
+    description_parts = []
+    if news_config.get('include_excerpt') and excerpt:
+        max_excerpt_len = min(parse_int(news_config.get('excerpt_length'), 280), 12000)
+        excerpt = excerpt[:max_excerpt_len].strip() if len(excerpt) > max_excerpt_len else excerpt
+        description_parts = split_text_preserving_format(excerpt, 4000)
+
+    if not description_parts:
+        description_parts = ['No patch note body was included in this Steam news post.']
+
+    total_parts = len(description_parts)
+    embeds = []
+
+    for idx, part in enumerate(description_parts, start=1):
+        embed = {
+            "title": title if total_parts == 1 else (title if idx == 1 else f"{title} (cont. {idx}/{total_parts})"),
+            "url": news_item.get('url') or f"https://store.steampowered.com/app/{app_id}/",
+            "color": int(news_config.get('embed_color', '#66C0F4').lstrip('#'), 16),
+            "timestamp": datetime.utcfromtimestamp(parse_int(news_item.get('date'), int(time.time()))).isoformat() + "Z",
+            "footer": {"text": f"{game_name} Steam news" if total_parts == 1 else f"{game_name} Steam news • part {idx}/{total_parts}"},
+            "description": part
+        }
+
+        if idx == 1 and news_config.get('include_author') and news_item.get('author'):
+            embed["author"] = {"name": str(news_item.get('author'))}
+
+        if idx == 1:
+            fields = []
+            if version:
+                fields.append(("Version", version, True))
+            fields.append(("Feed", news_item.get('feedlabel') or 'Steam', True))
+            embed["fields"] = [{"name": str(name), "value": str(value), "inline": bool(inline)} for name, value, inline in fields]
+
+            if news_config.get('use_header_image') and app_details and app_details.get('header_image'):
+                embed["thumbnail"] = {"url": app_details.get('header_image')}
+
+        embeds.append(embed)
+
+    return embeds
 
 
 def send_discord(dc_config, embed, content=""):
@@ -546,6 +1096,83 @@ def send_discord(dc_config, embed, content=""):
         print(f"  [DC] Sent to {len(dc_config.get('webhook_urls', []))} webhooks")
     except Exception as e:
         print(f"  [DC ERROR] {e}")
+
+
+def send_discord_updates(news_config, embed, content="", metadata=None):
+    if not discord_updates_ready(news_config):
+        return
+    meta = metadata or {}
+    try:
+        for idx, webhook_url in enumerate(news_config.get('webhook_urls', []), start=1):
+            embeds = embed if isinstance(embed, list) else [embed]
+            for embed_idx, single_embed in enumerate(embeds, start=1):
+                payload = {"embeds": [single_embed]}
+                if content and embed_idx == 1:
+                    payload["content"] = content
+                response = post_json(webhook_url + ("&" if "?" in webhook_url else "?") + "wait=true", payload, f"discord_news_{idx}_{embed_idx}")
+                if response and response.get("id"):
+                    save_discord_update_post(
+                        meta.get("app_id", ""),
+                        meta.get("game_name", ""),
+                        meta.get("news_gid", ""),
+                        meta.get("news_url", single_embed.get("url", "")),
+                        webhook_url,
+                        response.get("id", ""),
+                        embed_idx,
+                        payload.get("content", ""),
+                        single_embed
+                    )
+        print(f"  [DC NEWS] Sent to {len(news_config.get('webhook_urls', []))} webhooks")
+    except Exception as e:
+        print(f"  [DC NEWS ERROR] {e}")
+
+
+def edit_discord_update_message(post_id, content, embed):
+    post = get_discord_update_post(post_id)
+    if not post:
+        return False, "Discord update post not found."
+    if not post.get("webhook_url") or not post.get("message_id"):
+        return False, "Stored webhook reference is incomplete."
+
+    payload = {
+        "content": str(content or ''),
+        "embeds": [embed or {}]
+    }
+    url = post["webhook_url"].rstrip('/') + f"/messages/{post['message_id']}"
+    response = send_json(url, payload, f"discord_news_edit_{post_id}", method="PATCH")
+    if response is None:
+        return False, "Discord message edit failed."
+
+    update_discord_update_post(post_id, payload["content"], embed or {})
+    return True, "Discord message updated."
+
+
+def delete_discord_update_message(post_id):
+    post = get_discord_update_post(post_id)
+    if not post:
+        return False, "Discord update post not found."
+    if not post.get("webhook_url") or not post.get("message_id"):
+        return False, "Stored webhook reference is incomplete."
+
+    url = post["webhook_url"].rstrip('/') + f"/messages/{post['message_id']}"
+    response = send_json(url, {}, f"discord_news_delete_{post_id}", method="DELETE")
+    if response is None:
+        # Discord returns 204 No Content on success, which also maps to {} above.
+        # A `None` here means the request failed.
+        return False, "Discord message delete failed."
+
+    delete_discord_update_post(post_id)
+    return True, "Discord message deleted."
+
+
+def get_discord_dashboard_payload():
+    settings = get_all_settings()
+    return {
+        "games": settings.get("games", []),
+        "discord": settings.get("discord", {}),
+        "discord_updates": settings.get("discord_updates", {}),
+        "posts": list_discord_update_posts(200)
+    }
 
 
 def notify_channels(tg_config, dc_config, telegram_message=None, discord_embed=None, discord_content=""):
@@ -752,6 +1379,104 @@ def send_test_alert(settings, game, alert_type):
     return True, f"Sent {alert_type} test alert for {game_name}."
 
 
+def send_test_news_alert(settings, game):
+    news_config = settings.get('discord_updates', {})
+    if not discord_updates_ready(news_config):
+        return False, "No Discord Updates webhook is configured."
+
+    app_id = str(game['app_id'])
+    game_name = game.get('name') or get_game_name_from_api(app_id)
+    app_details = get_app_details(app_id)
+    news_item = {
+        "gid": f"test-{app_id}",
+        "title": f"{game_name} update test",
+        "url": f"https://store.steampowered.com/app/{app_id}/",
+        "author": "SteamDash",
+        "contents": "This is a synthetic Steam news update preview from SteamDash. It uses your Discord Updates webhook settings without touching the existing sales or wishlist alert channel.",
+        "feedlabel": "SteamDash Test",
+        "date": int(time.time()),
+        "is_external_url": False,
+    }
+    embeds = build_discord_news_embeds(app_id, game_name, news_item, news_config, app_details=app_details)
+    send_discord_updates(
+        news_config,
+        embeds,
+        news_config.get('mention_text', ''),
+        metadata={"app_id": app_id, "game_name": game_name, "news_gid": news_item.get("gid", ""), "news_url": news_item.get("url", "")}
+    )
+    return True, f"Sent Discord Updates test message for {game_name}."
+
+
+def send_latest_news_preview(settings, game):
+    news_config = settings.get('discord_updates', {})
+    if not discord_updates_ready(news_config):
+        return False, "No Discord Updates webhook is configured."
+
+    app_id = str(game['app_id'])
+    game_name = game.get('name') or get_game_name_from_api(app_id)
+    news_items = fetch_steam_news(app_id, count=1)
+    if not news_items:
+        return False, f"No Steam news posts found for {game_name}."
+
+    latest = news_items[0]
+    app_details = get_app_details(app_id) if news_config.get('use_header_image') else None
+    embeds = build_discord_news_embeds(app_id, game_name, latest, news_config, app_details=app_details)
+    send_discord_updates(
+        news_config,
+        embeds,
+        news_config.get('mention_text', ''),
+        metadata={"app_id": app_id, "game_name": game_name, "news_gid": latest.get("gid", ""), "news_url": latest.get("url", "")}
+    )
+    return True, f"Sent latest Steam news preview for {game_name}: {latest.get('title', 'Untitled post')}"
+
+
+def process_steam_news_updates(game, news_config):
+    if not discord_updates_enabled(news_config):
+        return
+
+    app_id = str(game['app_id'])
+    game_name = game.get('name') or app_id
+    state = get_news_state(app_id)
+    last_gid = str(state.get('last_gid') or '')
+    news_items = fetch_steam_news(app_id, count=100)
+    if not news_items:
+        return
+
+    unseen = []
+    for item in news_items:
+        gid = str(item.get('gid') or '')
+        if last_gid and gid == last_gid:
+            break
+        unseen.append(item)
+
+    if not last_gid and not news_config.get('post_existing'):
+        newest = news_items[0]
+        set_news_state(app_id, newest.get('gid', ''), newest.get('date', 0))
+        print(f"  [{game_name}] News baseline set to {newest.get('title', 'latest post')}")
+        return
+
+    if not unseen:
+        return
+
+    app_details = get_app_details(app_id) if news_config.get('use_header_image') else None
+    max_posts = max(1, parse_int(news_config.get('max_posts_per_check'), 3))
+    queue = list(reversed(unseen))[:max_posts]
+
+    for item in queue:
+        gid = str(item.get('gid') or '')
+        if not gid:
+            continue
+        embeds = build_discord_news_embeds(app_id, game_name, item, news_config, app_details=app_details)
+        send_discord_updates(
+            news_config,
+            embeds,
+            news_config.get('mention_text', ''),
+            metadata={"app_id": app_id, "game_name": game_name, "news_gid": item.get("gid", ""), "news_url": item.get("url", "")}
+        )
+        set_news_state(app_id, gid, item.get('date', 0))
+        print(f"  [{game_name}] News posted: {item.get('title', gid)}")
+
+
 # ========== DATA COLLECTOR ==========
 
 class GameState:
@@ -769,6 +1494,7 @@ class GameState:
         self.cached_wishlist = {}
         self.cached_sales_by_country = {}
         self.cached_wishlist_by_country = {}
+        self.last_news_check_at = None
 
 
 class DataCollector:
@@ -807,6 +1533,7 @@ class DataCollector:
         games = settings.get('games', [])
         tg = settings.get('telegram', {})
         dc = settings.get('discord', {})
+        dc_updates = settings.get('discord_updates', {})
 
         if not games:
             return
@@ -822,6 +1549,20 @@ class DataCollector:
             game_name = game.get('name', app_id)
             gs = self.get_state(app_id)
             wishlist_baseline = parse_int(game.get('wishlist_baseline', 0), 0)
+
+            news_interval = max(5, parse_int(dc_updates.get('check_interval_minutes'), 15))
+            news_due = (
+                discord_updates_enabled(dc_updates) and (
+                    gs.last_news_check_at is None or
+                    (datetime.now() - gs.last_news_check_at) >= timedelta(minutes=news_interval)
+                )
+            )
+            if news_due:
+                try:
+                    process_steam_news_updates(game, dc_updates)
+                except Exception as e:
+                    print(f"  [{game_name}] [NEWS ERROR] {e}")
+                gs.last_news_check_at = datetime.now()
 
             # Players + Reviews
             players = get_current_players(api_key, app_id)
@@ -1205,7 +1946,19 @@ textarea {
   min-height: 88px;
   resize: vertical;
 }
-input:focus, textarea:focus {
+select {
+  width: 100%;
+  padding: 10px 14px;
+  background: #32404e;
+  border: 1px solid #556772;
+  border-radius: 4px;
+  color: var(--steam-text);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  transition: all 0.2s;
+  outline: none;
+}
+input:focus, textarea:focus, select:focus {
   border-color: var(--steam-blue-light);
   box-shadow: 0 0 8px rgba(102,192,244,0.3);
 }
@@ -1277,6 +2030,62 @@ input::placeholder, textarea::placeholder {
 }
 .dc-fields.visible {
   display: block;
+}
+.dc-news-fields {
+  display: none;
+  margin-top: 18px;
+}
+.dc-news-fields.visible {
+  display: block;
+}
+.field-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.checkbox-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 14px;
+  margin-top: 18px;
+  padding: 16px;
+  background: rgba(0,0,0,0.2);
+  border: 1px solid rgba(42,71,94,0.4);
+  border-radius: 4px;
+}
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--steam-text);
+}
+.check-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--steam-blue-light);
+  flex-shrink: 0;
+}
+.inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 18px;
+}
+.inline-actions .hint {
+  margin: 0;
+  font-size: 12px;
+}
+.panel-note {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: rgba(0,0,0,0.2);
+  border: 1px solid rgba(42,71,94,0.4);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--steam-text-dim);
+  line-height: 1.6;
 }
 /* Game list */
 .game-item {
@@ -1487,6 +2296,11 @@ input::placeholder, textarea::placeholder {
   background: linear-gradient(to right, #8ecb2a, #6aa020);
   color: #ffffff;
 }
+@media (max-width: 700px) {
+  .field-grid, .checkbox-grid {
+    grid-template-columns: 1fr;
+  }
+}
 </style>
 </head>
 <body>
@@ -1500,8 +2314,9 @@ input::placeholder, textarea::placeholder {
     <div class="step-dot active" data-step="0" data-i18n="stepWelcome">INTRO</div>
     <div class="step-dot" data-step="1" data-i18n="stepConnection">CONNECT</div>
     <div class="step-dot" data-step="2" data-i18n="stepTelegram">ALERTS</div>
-    <div class="step-dot" data-step="3" data-i18n="stepPrefs">PREFS</div>
-    <div class="step-dot" data-step="4" data-i18n="stepConfirm">GO</div>
+    <div class="step-dot" data-step="3" data-i18n="stepUpdates">UPDATES</div>
+    <div class="step-dot" data-step="4" data-i18n="stepPrefs">PREFS</div>
+    <div class="step-dot" data-step="5" data-i18n="stepConfirm">GO</div>
   </div>
 
   <!-- Step 0: Welcome -->
@@ -1583,8 +2398,75 @@ input::placeholder, textarea::placeholder {
     </div>
   </div>
 
-  <!-- Step 3: Preferences -->
+  <!-- Step 3: Discord Updates -->
   <div class="step-panel" data-step="3">
+    <div class="card">
+      <h2 data-i18n="discordUpdatesTitle">Discord Updates</h2>
+      <div class="hint" data-i18n="discordUpdatesHint">Watch Steam news posts for each monitored game and push new update embeds into a separate Discord channel.</div>
+
+      <div class="toggle-row">
+        <div class="toggle" id="dcNewsToggle" onclick="toggleDiscordNews()"></div>
+        <span class="toggle-label" data-i18n="enableDiscordUpdates">Enable Steam news update posts</span>
+      </div>
+
+      <div class="dc-news-fields" id="dcNewsFields">
+        <label data-i18n="discordUpdatesWebhookLabel">Webhook URLs (comma or newline separated)</label>
+        <textarea id="dcNewsWebhookUrls" placeholder="https://discord.com/api/webhooks/..."></textarea>
+
+        <div class="field-grid">
+          <div>
+            <label data-i18n="discordUpdatesMentionLabel">Mention Text</label>
+            <input type="text" id="dcNewsMentionText" placeholder="@everyone" />
+          </div>
+          <div>
+            <label data-i18n="discordUpdatesPrefixLabel">Title Prefix</label>
+            <input type="text" id="dcNewsTitlePrefix" placeholder="[Steam Update]" />
+          </div>
+        </div>
+
+        <div class="field-grid">
+          <div>
+            <label data-i18n="discordUpdatesColorLabel">Embed Color</label>
+            <input type="text" id="dcNewsEmbedColor" placeholder="#66C0F4" />
+          </div>
+          <div>
+            <label data-i18n="discordUpdatesExcerptLabel">Excerpt Length</label>
+            <input type="number" id="dcNewsExcerptLength" min="80" max="12000" value="280" />
+          </div>
+        </div>
+
+        <div class="field-grid">
+          <div>
+            <label data-i18n="discordUpdatesIntervalLabel">Check Interval (minutes)</label>
+            <input type="number" id="dcNewsInterval" min="5" max="1440" value="15" />
+          </div>
+          <div>
+            <label data-i18n="discordUpdatesBurstLabel">Max Posts Per Check</label>
+            <input type="number" id="dcNewsBurst" min="1" max="10" value="3" />
+          </div>
+        </div>
+
+        <div class="checkbox-grid">
+          <label class="check-row"><input type="checkbox" id="dcNewsIncludeExcerpt" checked /> <span data-i18n="discordUpdatesIncludeExcerpt">Include excerpt text</span></label>
+          <label class="check-row"><input type="checkbox" id="dcNewsIncludeAuthor" checked /> <span data-i18n="discordUpdatesIncludeAuthor">Include author name</span></label>
+          <label class="check-row"><input type="checkbox" id="dcNewsUseImage" checked /> <span data-i18n="discordUpdatesUseImage">Use game header image</span></label>
+          <label class="check-row"><input type="checkbox" id="dcNewsPostExisting" /> <span data-i18n="discordUpdatesPostExisting">Post the latest existing update when first enabled</span></label>
+        </div>
+
+        <div class="inline-actions">
+          <button class="test-btn" id="testNewsBtn" onclick="sendDiscordNewsTest()" data-i18n="discordUpdatesTestBtn">Send Test Update</button>
+          <button class="test-btn" id="previewLatestNewsBtn" onclick="sendLatestDiscordNewsPreview()" data-i18n="discordUpdatesPreviewBtn">Preview Latest Real Post</button>
+          <div class="hint" data-i18n="discordUpdatesTestHint">Uses the first configured game and only the Discord Updates webhook.</div>
+        </div>
+        <div class="test-result" id="testNewsResult"></div>
+      </div>
+
+      <div class="panel-note" data-i18n="discordUpdatesNote">This page is separate from the standard Discord alert webhooks for sales, wishlists, reviews, and player spikes.</div>
+    </div>
+  </div>
+
+  <!-- Step 4: Preferences -->
+  <div class="step-panel" data-step="4">
     <div class="card">
       <h2 data-i18n="prefsTitle">Preferences</h2>
       <div class="hint" data-i18n="prefsHint">Customize the look and feel of your dashboard.</div>
@@ -1605,11 +2487,29 @@ input::placeholder, textarea::placeholder {
 
       <label style="margin-top:20px;" data-i18n="portLabel">Port</label>
       <input type="number" id="portInput" value="{{PORT}}" min="1024" max="65535" />
+
+      <hr class="divider">
+
+      <h2 data-i18n="discordDashAuthTitle" style="margin-top:0;">Discord Dashboard Login</h2>
+      <div class="hint" data-i18n="discordDashAuthHint">Protect the Discord Dashboard and its management APIs with a separate username and password.</div>
+      <div class="field-grid">
+        <div>
+          <label data-i18n="discordDashUserLabel">Username</label>
+          <input type="text" id="discordDashUser" placeholder="admin" />
+        </div>
+        <div>
+          <label data-i18n="discordDashPassLabel">Password</label>
+          <input type="password" id="discordDashPass" placeholder="Set a password" />
+        </div>
+      </div>
+      <div class="hint" id="discordDashPassHint" style="margin-top:10px;margin-bottom:0;font-size:12px;">
+        Set the credentials now. When editing settings later, leave the password blank to keep the current one.
+      </div>
     </div>
   </div>
 
-  <!-- Step 4: Confirm -->
-  <div class="step-panel" data-step="4">
+  <!-- Step 5: Confirm -->
+  <div class="step-panel" data-step="5">
     <div class="card" style="text-align:center;">
       <h2 data-i18n="readyTitle">Ready to Go</h2>
       <div class="hint" style="margin-bottom:8px;" data-i18n="readyHint">
@@ -1635,7 +2535,7 @@ input::placeholder, textarea::placeholder {
     ko: {
       setupTitle: 'Steam \\ub300\\uc2dc\\ubcf4\\ub4dc \\uc124\\uc815',
       setupDesc: 'Steam \\uac8c\\uc784\\uc758 \\ud310\\ub9e4, \\uc218\\uc775, \\ub9ac\\ubdf0, \\ub3d9\\uc811\\uc790, \\uc704\\uc2dc\\ub9ac\\uc2a4\\ud2b8\\ub97c \\uc2e4\\uc2dc\\uac04\\uc73c\\ub85c \\ubaa8\\ub2c8\\ud130\\ub9c1\\ud569\\ub2c8\\ub2e4.',
-      stepWelcome: '\\uc18c\\uac1c', stepConnection: '\\uc5f0\\uacb0', stepTelegram: '\\uc54c\\ub9bc', stepPrefs: '\\uc124\\uc815', stepConfirm: '\\uc2dc\\uc791',
+      stepWelcome: '\\uc18c\\uac1c', stepConnection: '\\uc5f0\\uacb0', stepTelegram: '\\uc54c\\ub9bc', stepUpdates: 'UPDATES', stepPrefs: '\\uc124\\uc815', stepConfirm: '\\uc2dc\\uc791',
       welcomeTitle: '\\ud658\\uc601\\ud569\\ub2c8\\ub2e4',
       welcomeHint: '\\uc774 \\ub300\\uc2dc\\ubcf4\\ub4dc\\ub294 Steam \\uac8c\\uc784\\uc758 \\ud310\\ub9e4, \\uc218\\uc775, \\ub9ac\\ubdf0, \\ub3d9\\uc2dc \\uc811\\uc18d\\uc790, \\uc704\\uc2dc\\ub9ac\\uc2a4\\ud2b8\\ub97c \\uc2e4\\uc2dc\\uac04\\uc73c\\ub85c \\ucd94\\uc801\\ud569\\ub2c8\\ub2e4. \\ud154\\ub808\\uadf8\\ub78c\\uacfc \\ub514\\uc2a4\\ucf54\\ub4dc \\uc54c\\ub9bc\\ub3c4 \\ubcf4\\ub0bc \\uc218 \\uc788\\uc2b5\\ub2c8\\ub2e4.<br><br>\\ud544\\uc694\\ud55c \\uac83:<br>&bull; <a href="https://steamcommunity.com/dev/apikey" target="_blank">Steam Web API \\ud0a4</a><br>&bull; <a href="https://partner.steampowered.com/" target="_blank">Steamworks Financial API \\ud0a4</a> (Partner \\uc0ac\\uc774\\ud2b8\\uc5d0\\uc11c)<br>&bull; \\uac8c\\uc784\\uc758 App ID',
       connectionTitle: 'Steam \\uc5f0\\uacb0',
@@ -1659,6 +2559,10 @@ input::placeholder, textarea::placeholder {
       chatIdsLabel: '\\ucc44\\ud305 ID (\\uc27c\\ud45c\\ub85c \\uad6c\\ubd84)',
       prefsTitle: '\\ud658\\uacbd \\uc124\\uc815',
       prefsHint: '\\ub300\\uc2dc\\ubcf4\\ub4dc\\uc758 \\uc678\\uad00\\uc744 \\ucee4\\uc2a4\\ud130\\ub9c8\\uc774\\uc988\\ud558\\uc138\\uc694.',
+      discordDashAuthTitle: 'Discord Dashboard Login',
+      discordDashAuthHint: 'Protect the Discord Dashboard and its management APIs with a separate username and password.',
+      discordDashUserLabel: 'Username',
+      discordDashPassLabel: 'Password',
       languageLabel: '\\uc5b8\\uc5b4',
       accentLabel: '\\uc561\\uc13c\\ud2b8 \\uc0c9\\uc0c1',
       portLabel: '\\ud3ec\\ud2b8',
@@ -1681,7 +2585,7 @@ input::placeholder, textarea::placeholder {
     en: {
       setupTitle: 'Steam Dashboard Setup',
       setupDesc: 'Real-time sales monitoring for your Steam games. Let\\'s get you set up in a few quick steps.',
-      stepWelcome: 'INTRO', stepConnection: 'CONNECT', stepTelegram: 'ALERTS', stepPrefs: 'PREFS', stepConfirm: 'GO',
+      stepWelcome: 'INTRO', stepConnection: 'CONNECT', stepTelegram: 'ALERTS', stepUpdates: 'UPDATES', stepPrefs: 'PREFS', stepConfirm: 'GO',
       welcomeTitle: 'Welcome',
       welcomeHint: 'This dashboard tracks your Steam game\\'s sales, revenue, reviews, concurrent players, and wishlists in real-time. It can also send you Telegram and Discord alerts when something happens.<br><br>You\\'ll need:<br>&bull; A <a href="https://steamcommunity.com/dev/apikey" target="_blank">Steam Web API Key</a><br>&bull; A <a href="https://partner.steampowered.com/" target="_blank">Steamworks Financial API Key</a> (from Partner site)<br>&bull; Your game\\'s App ID',
       connectionTitle: 'Steam Connection',
@@ -1705,6 +2609,10 @@ input::placeholder, textarea::placeholder {
       chatIdsLabel: 'Chat IDs (comma-separated)',
       prefsTitle: 'Preferences',
       prefsHint: 'Customize the look and feel of your dashboard.',
+      discordDashAuthTitle: 'Discord Dashboard Login',
+      discordDashAuthHint: 'Protect the Discord Dashboard and its management APIs with a separate username and password.',
+      discordDashUserLabel: 'Username',
+      discordDashPassLabel: 'Password',
       languageLabel: 'Language',
       accentLabel: 'Accent Color',
       portLabel: 'Port',
@@ -1722,7 +2630,28 @@ input::placeholder, textarea::placeholder {
       testGameFail: 'Failed',
       testFillFirst: 'Please fill in the API key and at least one App ID first.',
       testMustPass: 'Connection test must pass before proceeding.',
-      addGameAlert: 'Please add at least one game.'
+      addGameAlert: 'Please add at least one game.',
+      discordUpdatesTitle: 'Discord Updates',
+      discordUpdatesHint: 'Watch Steam news posts for each monitored game and push new update embeds into a separate Discord channel.',
+      enableDiscordUpdates: 'Enable Steam news update posts',
+      discordUpdatesWebhookLabel: 'Webhook URLs (comma or newline separated)',
+      discordUpdatesMentionLabel: 'Mention Text',
+      discordUpdatesPrefixLabel: 'Title Prefix',
+      discordUpdatesColorLabel: 'Embed Color',
+      discordUpdatesExcerptLabel: 'Excerpt Length',
+      discordUpdatesIntervalLabel: 'Check Interval (minutes)',
+      discordUpdatesBurstLabel: 'Max Posts Per Check',
+      discordUpdatesIncludeExcerpt: 'Include excerpt text',
+      discordUpdatesIncludeAuthor: 'Include author name',
+      discordUpdatesUseImage: 'Use game header image',
+      discordUpdatesPostExisting: 'Post the latest existing update when first enabled',
+      discordUpdatesTestBtn: 'Send Test Update',
+      discordUpdatesPreviewBtn: 'Preview Latest Real Post',
+      discordUpdatesTestHint: 'Uses the first configured game and only the Discord Updates webhook.',
+      discordUpdatesNote: 'This page is separate from the standard Discord alert webhooks for sales, wishlists, reviews, and player spikes.',
+      discordUpdatesTesting: 'Sending test update...',
+      discordUpdatesPreviewing: 'Sending latest Steam news preview...',
+      discordUpdatesTestMissing: 'Add at least one game and a Discord Updates webhook first.'
     }
   };
 
@@ -1740,12 +2669,14 @@ input::placeholder, textarea::placeholder {
   }
 
   var currentStep = 0;
-  var totalSteps = 5;
+  var totalSteps = 6;
   var selectedLang = currentLang;
   var selectedAccent = 'steam';
   var tgEnabled = false;
   var dcEnabled = false;
+  var dcNewsEnabled = false;
   var connectionTested = false;
+  var discordDashHasPassword = false;
 
   // Pre-fill if editing settings
   var existingSettings = {{EXISTING_SETTINGS_JSON}};
@@ -1767,6 +2698,29 @@ input::placeholder, textarea::placeholder {
       document.getElementById('dcToggle').classList.add('on');
       document.getElementById('dcFields').classList.add('visible');
       document.getElementById('dcWebhookUrls').value = (dc.webhook_urls || []).join('\\n');
+    }
+    var dcNews = existingSettings.discord_updates || {};
+    if (dcNews.enabled) {
+      dcNewsEnabled = true;
+      document.getElementById('dcNewsToggle').classList.add('on');
+      document.getElementById('dcNewsFields').classList.add('visible');
+    }
+    document.getElementById('dcNewsWebhookUrls').value = (dcNews.webhook_urls || []).join('\\n');
+    document.getElementById('dcNewsMentionText').value = dcNews.mention_text || '';
+    document.getElementById('dcNewsTitlePrefix').value = dcNews.title_prefix || '';
+    document.getElementById('dcNewsEmbedColor').value = dcNews.embed_color || '#66C0F4';
+    document.getElementById('dcNewsExcerptLength').value = dcNews.excerpt_length || 280;
+    document.getElementById('dcNewsInterval').value = dcNews.check_interval_minutes || 15;
+    document.getElementById('dcNewsBurst').value = dcNews.max_posts_per_check || 3;
+    document.getElementById('dcNewsIncludeExcerpt').checked = dcNews.include_excerpt !== false;
+    document.getElementById('dcNewsIncludeAuthor').checked = dcNews.include_author !== false;
+    document.getElementById('dcNewsUseImage').checked = dcNews.use_header_image !== false;
+    document.getElementById('dcNewsPostExisting').checked = !!dcNews.post_existing;
+    var dashAuth = existingSettings.discord_dashboard_auth || {};
+    document.getElementById('discordDashUser').value = dashAuth.username || '';
+    discordDashHasPassword = !!dashAuth.has_password;
+    if (discordDashHasPassword) {
+      document.getElementById('discordDashPassHint').textContent = 'Leave the password blank to keep the current Discord Dashboard password.';
     }
     var dash = existingSettings.dashboard || {};
     selectedLang = dash.language || currentLang;
@@ -1841,6 +2795,19 @@ input::placeholder, textarea::placeholder {
     }
   };
 
+  window.toggleDiscordNews = function() {
+    dcNewsEnabled = !dcNewsEnabled;
+    var el = document.getElementById('dcNewsToggle');
+    var fields = document.getElementById('dcNewsFields');
+    if (dcNewsEnabled) {
+      el.classList.add('on');
+      fields.classList.add('visible');
+    } else {
+      el.classList.remove('on');
+      fields.classList.remove('visible');
+    }
+  };
+
   window.selectLang = function(lang) {
     selectedLang = lang;
     currentLang = lang;
@@ -1897,6 +2864,9 @@ input::placeholder, textarea::placeholder {
       .then(function(r) { return r.json(); })
       .then(function(data) {
         testBtn.disabled = false;
+        resultEl.style.background = '';
+        resultEl.style.borderColor = '';
+        resultEl.style.color = '';
         var lines = [];
 
         // API key status
@@ -1955,11 +2925,89 @@ input::placeholder, textarea::placeholder {
       })
       .catch(function(e) {
         testBtn.disabled = false;
+        resultEl.style.background = '';
+        resultEl.style.borderColor = '';
+        resultEl.style.color = '';
         resultEl.className = 'test-result error';
         resultEl.textContent = 'Network error: ' + e.message;
         connectionTested = false;
       });
   };
+
+  window.sendDiscordNewsTest = function() {
+    sendDiscordNewsAction('test');
+  };
+
+  window.sendLatestDiscordNewsPreview = function() {
+    sendDiscordNewsAction('latest');
+  };
+
+  function sendDiscordNewsAction(mode) {
+    var validGames = games.filter(function(g) { return g.app_id; });
+    var webhookUrlsStr = document.getElementById('dcNewsWebhookUrls').value.trim();
+    var webhookUrls = webhookUrlsStr ? webhookUrlsStr.split(/\\r?\\n|,/).map(function(s) { return s.trim(); }).filter(Boolean) : [];
+    var resultEl = document.getElementById('testNewsResult');
+    var testBtn = document.getElementById('testNewsBtn');
+    var previewBtn = document.getElementById('previewLatestNewsBtn');
+
+    if (!validGames.length || !webhookUrls.length) {
+      resultEl.className = 'test-result error';
+      resultEl.textContent = T('discordUpdatesTestMissing');
+      return;
+    }
+
+    testBtn.disabled = true;
+    previewBtn.disabled = true;
+    resultEl.className = 'test-result';
+    resultEl.style.display = 'block';
+    resultEl.style.background = 'rgba(102,192,244,0.1)';
+    resultEl.style.borderColor = 'rgba(102,192,244,0.3)';
+    resultEl.style.color = '#66c0f4';
+    resultEl.textContent = mode === 'latest' ? T('discordUpdatesPreviewing') : T('discordUpdatesTesting');
+
+    fetch('/api/test-news-alert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: mode,
+        app_id: validGames[0].app_id,
+        game_name: validGames[0].name || '',
+        discord_updates: {
+          enabled: dcNewsEnabled,
+          webhook_urls: webhookUrls,
+          mention_text: document.getElementById('dcNewsMentionText').value.trim(),
+          title_prefix: document.getElementById('dcNewsTitlePrefix').value.trim(),
+          embed_color: document.getElementById('dcNewsEmbedColor').value.trim(),
+          include_excerpt: document.getElementById('dcNewsIncludeExcerpt').checked,
+          excerpt_length: parseInt(document.getElementById('dcNewsExcerptLength').value, 10) || 280,
+          include_author: document.getElementById('dcNewsIncludeAuthor').checked,
+          use_header_image: document.getElementById('dcNewsUseImage').checked,
+          post_existing: document.getElementById('dcNewsPostExisting').checked,
+          check_interval_minutes: parseInt(document.getElementById('dcNewsInterval').value, 10) || 15,
+          max_posts_per_check: parseInt(document.getElementById('dcNewsBurst').value, 10) || 3
+        }
+      })
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        testBtn.disabled = false;
+        previewBtn.disabled = false;
+        resultEl.style.background = '';
+        resultEl.style.borderColor = '';
+        resultEl.style.color = '';
+        resultEl.className = data.success ? 'test-result success' : 'test-result error';
+        resultEl.textContent = data.message || (data.success ? 'OK' : 'Failed');
+      })
+      .catch(function(e) {
+        testBtn.disabled = false;
+        previewBtn.disabled = false;
+        resultEl.style.background = '';
+        resultEl.style.borderColor = '';
+        resultEl.style.color = '';
+        resultEl.className = 'test-result error';
+        resultEl.textContent = 'Network error: ' + e.message;
+      });
+  }
 
   function updateStepDots() {
     document.querySelectorAll('.step-dot').forEach(function(dot, i) {
@@ -1990,6 +3038,8 @@ input::placeholder, textarea::placeholder {
       lines.push('Games: ' + games.filter(function(g){return g.app_id;}).map(function(g){return g.app_id + (g.name ? ' (' + g.name + ')' : '');}).join(', '));
       lines.push('Telegram: ' + (tgEnabled ? 'ON' : 'OFF'));
       lines.push('Discord: ' + (dcEnabled ? 'ON' : 'OFF'));
+      lines.push('Discord Updates: ' + (dcNewsEnabled ? 'ON' : 'OFF'));
+      lines.push('Discord Dashboard Login: ' + (document.getElementById('discordDashUser').value.trim() ? 'SET' : 'MISSING'));
       lines.push('Accent: ' + selectedAccent);
       lines.push('Language: ' + selectedLang);
       lines.push('Port: ' + document.getElementById('portInput').value);
@@ -2039,11 +3089,19 @@ input::placeholder, textarea::placeholder {
       alert(T('addGameAlert'));
       return;
     }
+    var dashboardUser = document.getElementById('discordDashUser').value.trim();
+    var dashboardPass = document.getElementById('discordDashPass').value;
+    if (!dashboardUser || (!discordDashHasPassword && !dashboardPass.trim())) {
+      alert('Discord Dashboard username and password are required.');
+      return;
+    }
 
     var chatIdsStr = document.getElementById('tgChatIds').value.trim();
     var chatIds = chatIdsStr ? chatIdsStr.split(',').map(function(s) { return s.trim(); }).filter(Boolean) : [];
     var webhookUrlsStr = document.getElementById('dcWebhookUrls').value.trim();
     var webhookUrls = webhookUrlsStr ? webhookUrlsStr.split(/\\r?\\n|,/).map(function(s) { return s.trim(); }).filter(Boolean) : [];
+    var newsWebhookUrlsStr = document.getElementById('dcNewsWebhookUrls').value.trim();
+    var newsWebhookUrls = newsWebhookUrlsStr ? newsWebhookUrlsStr.split(/\\r?\\n|,/).map(function(s) { return s.trim(); }).filter(Boolean) : [];
 
     var payload = {
       steam_api_key: document.getElementById('steamApiKey').value.trim(),
@@ -2057,6 +3115,24 @@ input::placeholder, textarea::placeholder {
       discord: {
         enabled: dcEnabled,
         webhook_urls: webhookUrls
+      },
+      discord_updates: {
+        enabled: dcNewsEnabled,
+        webhook_urls: newsWebhookUrls,
+        mention_text: document.getElementById('dcNewsMentionText').value.trim(),
+        title_prefix: document.getElementById('dcNewsTitlePrefix').value.trim(),
+        embed_color: document.getElementById('dcNewsEmbedColor').value.trim(),
+        include_excerpt: document.getElementById('dcNewsIncludeExcerpt').checked,
+        excerpt_length: parseInt(document.getElementById('dcNewsExcerptLength').value, 10) || 280,
+        include_author: document.getElementById('dcNewsIncludeAuthor').checked,
+        use_header_image: document.getElementById('dcNewsUseImage').checked,
+        post_existing: document.getElementById('dcNewsPostExisting').checked,
+        check_interval_minutes: parseInt(document.getElementById('dcNewsInterval').value, 10) || 15,
+        max_posts_per_check: parseInt(document.getElementById('dcNewsBurst').value, 10) || 3
+      },
+      discord_dashboard_auth: {
+        username: dashboardUser,
+        password: dashboardPass
       },
       dashboard: {
         port: parseInt(document.getElementById('portInput').value) || 8081,
@@ -2103,6 +3179,525 @@ input::placeholder, textarea::placeholder {
 
 
 # ========== DASHBOARD HTML ==========
+
+DISCORD_DASHBOARD_HTML_TEMPLATE = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SteamDash Discord Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;600;700&family=Noto+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg-black: #171a21; --bg-deep: #1b2838; --bg-mid: #16202d;
+  --bg-elevated: #2a475e; --border-color: #2a475e; --border-light: #3d6c8e;
+  --text-primary: #c7d5e0; --text-secondary: #8f98a0; --text-tertiary: #556772;
+  --accent: #66c0f4; --green: #a4d007; --amber: #c9a84c; --red: #c45a5a;
+  --font-body: 'Noto Sans KR', 'Noto Sans', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg-black); color: var(--text-primary); font-family: var(--font-body);
+}
+.topbar {
+  padding: 18px 24px; border-bottom: 1px solid var(--border-color); background: var(--bg-deep);
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+}
+.topbar h1 { margin: 0; font-size: 22px; color: #fff; }
+.topbar p { margin: 4px 0 0; color: var(--text-secondary); font-size: 13px; }
+.topbar-actions { display: flex; gap: 8px; }
+.nav-btn, .save-btn, .secondary-btn {
+  border: 1px solid var(--border-color); background: transparent; color: var(--text-primary);
+  padding: 10px 14px; border-radius: 4px; text-decoration: none; cursor: pointer; font-size: 13px;
+}
+.save-btn { background: rgba(164,208,7,0.12); border-color: rgba(164,208,7,0.35); color: var(--green); }
+.secondary-btn { background: rgba(102,192,244,0.08); border-color: rgba(102,192,244,0.25); color: var(--accent); }
+.page { max-width: 1400px; margin: 0 auto; padding: 24px; }
+.tabs { display: flex; gap: 8px; margin-bottom: 16px; }
+.tab {
+  padding: 10px 14px; border: 1px solid var(--border-color); background: var(--bg-mid); color: var(--text-secondary);
+  border-radius: 4px; cursor: pointer; font-size: 13px;
+}
+.tab.active { color: #fff; border-color: var(--border-light); background: var(--bg-elevated); }
+.panel { display: none; }
+.panel.active { display: block; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.card {
+  background: var(--bg-mid); border: 1px solid var(--border-color); border-radius: 4px; padding: 18px;
+}
+.card h2 { margin: 0 0 8px; font-size: 18px; color: #fff; }
+.hint { color: var(--text-secondary); font-size: 13px; line-height: 1.6; margin-bottom: 16px; }
+label {
+  display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-secondary); margin: 14px 0 6px;
+}
+input[type="text"], input[type="number"], textarea {
+  width: 100%; background: #32404e; border: 1px solid #556772; color: var(--text-primary);
+  border-radius: 4px; padding: 10px 12px; font-family: var(--font-mono); font-size: 13px;
+}
+textarea { min-height: 92px; resize: vertical; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.check { display: flex; gap: 10px; align-items: center; margin-top: 12px; color: var(--text-primary); font-size: 13px; }
+.check input { accent-color: var(--accent); }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 16px; }
+.status {
+  margin-top: 12px; padding: 10px 12px; border-radius: 4px; font-family: var(--font-mono); font-size: 12px; display: none;
+}
+.status.ok { display: block; background: rgba(164,208,7,0.12); border: 1px solid rgba(164,208,7,0.35); color: var(--green); }
+.status.err { display: block; background: rgba(196,90,90,0.12); border: 1px solid rgba(196,90,90,0.35); color: var(--red); }
+.status.info { display: block; background: rgba(102,192,244,0.08); border: 1px solid rgba(102,192,244,0.25); color: var(--accent); }
+.post-layout { display: grid; grid-template-columns: 360px 1fr; gap: 16px; }
+.post-list {
+  max-height: 70vh; overflow: auto; display: flex; flex-direction: column; gap: 8px;
+}
+.post-item {
+  background: rgba(0,0,0,0.18); border: 1px solid rgba(42,71,94,0.45); border-radius: 4px; padding: 12px; cursor: pointer;
+}
+.post-item.active { border-color: var(--accent); background: rgba(102,192,244,0.08); }
+.post-item .title { color: #fff; font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+.post-item .meta { color: var(--text-secondary); font-size: 11px; font-family: var(--font-mono); line-height: 1.5; }
+.mono { font-family: var(--font-mono); }
+.empty {
+  padding: 18px; border: 1px dashed var(--border-color); border-radius: 4px; color: var(--text-secondary); font-size: 13px;
+}
+@media (max-width: 980px) {
+  .grid, .post-layout, .form-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div>
+    <h1>Discord Dashboard</h1>
+    <p>Manage alert webhooks, Steam news update webhooks, and edit posted Discord update embeds.</p>
+  </div>
+  <div class="topbar-actions">
+    <a class="nav-btn" href="/dashboard">Back to Dashboard</a>
+    <a class="nav-btn" href="/settings">Setup Wizard</a>
+  </div>
+</div>
+
+<div class="page">
+  <div class="tabs">
+    <button class="tab active" data-tab="alerts">Alert Webhooks</button>
+    <button class="tab" data-tab="updates">Update Webhooks</button>
+    <button class="tab" data-tab="posts">Posted Embeds</button>
+  </div>
+
+  <div class="panel active" data-panel="alerts">
+    <div class="grid">
+      <div class="card">
+        <h2>Discord Alerts</h2>
+        <div class="hint">These are the existing Discord webhooks used for sales, reviews, wishlists, startup reports, and player spikes.</div>
+        <label><input type="checkbox" id="alertsEnabled"> Enable Discord alert webhooks</label>
+        <label>Webhook URLs</label>
+        <textarea id="alertsWebhooks" placeholder="https://discord.com/api/webhooks/..."></textarea>
+        <div class="row">
+          <button class="save-btn" id="saveAlertsBtn">Save Alert Settings</button>
+        </div>
+        <div class="status" id="alertsStatus"></div>
+      </div>
+      <div class="card">
+        <h2>Current Games</h2>
+        <div class="hint">The Discord Dashboard uses your existing monitored games. Update app IDs and launch dates in the setup wizard.</div>
+        <div id="gamesSummary" class="mono"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel" data-panel="updates">
+    <div class="card">
+      <h2>Steam News Updates</h2>
+      <div class="hint">This is the separate webhook system for Steam news posts. These settings do not affect the alert webhook channel.</div>
+      <label><input type="checkbox" id="updatesEnabled"> Enable Steam news posts</label>
+      <label>Webhook URLs</label>
+      <textarea id="updatesWebhooks" placeholder="https://discord.com/api/webhooks/..."></textarea>
+      <div class="form-grid">
+        <div>
+          <label>Mention Text</label>
+          <input type="text" id="updatesMention" placeholder="@everyone">
+        </div>
+        <div>
+          <label>Title Prefix</label>
+          <input type="text" id="updatesPrefix" placeholder="[Steam News]">
+        </div>
+      </div>
+      <div class="form-grid">
+        <div>
+          <label>Embed Color</label>
+          <input type="text" id="updatesColor" placeholder="#66C0F4">
+        </div>
+        <div>
+          <label>Text Budget</label>
+          <input type="number" id="updatesExcerptLength" min="80" max="12000">
+        </div>
+      </div>
+      <div class="form-grid">
+        <div>
+          <label>Check Interval (minutes)</label>
+          <input type="number" id="updatesInterval" min="5" max="1440">
+        </div>
+        <div>
+          <label>Max Posts Per Check</label>
+          <input type="number" id="updatesBurst" min="1" max="10">
+        </div>
+      </div>
+      <label class="check"><input type="checkbox" id="updatesIncludeExcerpt"> Include excerpt text</label>
+      <label class="check"><input type="checkbox" id="updatesIncludeAuthor"> Include author name</label>
+      <label class="check"><input type="checkbox" id="updatesUseHeaderImage"> Use game header image</label>
+      <label class="check"><input type="checkbox" id="updatesPostExisting"> Post latest existing Steam update when first enabled</label>
+      <div class="row">
+        <button class="save-btn" id="saveUpdatesBtn">Save Update Settings</button>
+        <button class="secondary-btn" id="previewLatestUpdateBtn">Preview Latest Real Post</button>
+        <button class="secondary-btn" id="refreshPostsBtn">Refresh Posted Embed List</button>
+      </div>
+      <div class="status" id="updatesStatus"></div>
+    </div>
+  </div>
+
+  <div class="panel" data-panel="posts">
+    <div class="post-layout">
+      <div class="card">
+        <h2>Posted Update Embeds</h2>
+        <div class="hint">Only messages sent after tracking was added will appear here. Each continuation part is editable independently.</div>
+        <div class="post-list" id="postList"></div>
+      </div>
+      <div class="card">
+        <h2>Edit Posted Embed</h2>
+        <div class="hint">Select a posted update on the left, make corrections here, then push the edit directly to Discord through the stored webhook reference.</div>
+        <div id="postEditorEmpty" class="empty">No post selected.</div>
+        <div id="postEditor" style="display:none;">
+          <input type="hidden" id="editPostId">
+          <label>Webhook Content</label>
+          <textarea id="editContent" placeholder="@everyone"></textarea>
+          <div class="form-grid">
+            <div>
+              <label>Embed Title</label>
+              <input type="text" id="editTitle">
+            </div>
+            <div>
+              <label>Author</label>
+              <input type="text" id="editAuthor">
+            </div>
+          </div>
+          <div class="form-grid">
+            <div>
+              <label>Embed URL</label>
+              <input type="text" id="editUrl">
+            </div>
+            <div>
+              <label>Embed Color</label>
+              <input type="text" id="editEmbedColor">
+            </div>
+          </div>
+          <label>Description</label>
+          <textarea id="editDescription" style="min-height:280px;"></textarea>
+          <label>Footer</label>
+          <input type="text" id="editFooter">
+          <div class="row">
+            <button class="save-btn" id="savePostEditBtn">Update Discord Message</button>
+            <button class="secondary-btn" id="deletePostBtn" style="border-color: rgba(196,90,90,0.35); color: var(--red); background: rgba(196,90,90,0.08);">Delete Discord Message</button>
+            <a class="secondary-btn" id="openSourceLink" href="#" target="_blank">Open Source News</a>
+          </div>
+          <div class="status" id="postEditStatus"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function() {
+  var dashboardData = null;
+  var selectedPost = null;
+
+  function setStatus(id, kind, text) {
+    var el = document.getElementById(id);
+    el.className = 'status ' + kind;
+    el.textContent = text;
+  }
+
+  function splitWebhookText(value) {
+    return (value || '').split(/\\r?\\n|,/).map(function(item) { return item.trim(); }).filter(Boolean);
+  }
+
+  function switchTab(name) {
+    document.querySelectorAll('.tab').forEach(function(el) {
+      el.classList.toggle('active', el.getAttribute('data-tab') === name);
+    });
+    document.querySelectorAll('.panel').forEach(function(el) {
+      el.classList.toggle('active', el.getAttribute('data-panel') === name);
+    });
+  }
+
+  function loadIntoForms(data) {
+    dashboardData = data;
+    var dc = data.discord || {};
+    var du = data.discord_updates || {};
+
+    document.getElementById('alertsEnabled').checked = !!dc.enabled;
+    document.getElementById('alertsWebhooks').value = (dc.webhook_urls || []).join('\\n');
+
+    document.getElementById('updatesEnabled').checked = !!du.enabled;
+    document.getElementById('updatesWebhooks').value = (du.webhook_urls || []).join('\\n');
+    document.getElementById('updatesMention').value = du.mention_text || '';
+    document.getElementById('updatesPrefix').value = du.title_prefix || '';
+    document.getElementById('updatesColor').value = du.embed_color || '#66C0F4';
+    document.getElementById('updatesExcerptLength').value = du.excerpt_length || 3000;
+    document.getElementById('updatesInterval').value = du.check_interval_minutes || 15;
+    document.getElementById('updatesBurst').value = du.max_posts_per_check || 3;
+    document.getElementById('updatesIncludeExcerpt').checked = du.include_excerpt !== false;
+    document.getElementById('updatesIncludeAuthor').checked = du.include_author !== false;
+    document.getElementById('updatesUseHeaderImage').checked = du.use_header_image !== false;
+    document.getElementById('updatesPostExisting').checked = !!du.post_existing;
+
+    var games = data.games || [];
+    document.getElementById('gamesSummary').innerHTML = games.length
+      ? games.map(function(game) {
+          return '<div style="margin-bottom:10px;"><strong>' + (game.name || game.app_id) + '</strong><br>App ID: ' + game.app_id + '<br>Launch: ' + (game.launch_date || 'n/a') + '</div>';
+        }).join('')
+      : '<div class="empty">No games configured.</div>';
+
+    renderPostList(data.posts || []);
+  }
+
+  function renderPostList(posts) {
+    var list = document.getElementById('postList');
+    if (!posts.length) {
+      list.innerHTML = '<div class="empty">No tracked update-webhook posts yet.</div>';
+      selectedPost = null;
+      showPostEditor(null);
+      return;
+    }
+    if (selectedPost) {
+      selectedPost = posts.find(function(post) { return post.id === selectedPost.id; }) || null;
+    }
+    list.innerHTML = '';
+    posts.forEach(function(post) {
+      var item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'post-item' + (selectedPost && selectedPost.id === post.id ? ' active' : '');
+      item.innerHTML =
+        '<div class="title">' + ((post.embed && post.embed.title) || 'Untitled embed') + '</div>' +
+        '<div class="meta">' +
+          'Game: ' + (post.game_name || post.app_id || 'Unknown') + '<br>' +
+          'Message ID: ' + (post.message_id || 'n/a') + '<br>' +
+          'Part: ' + (post.message_index || 1) + '<br>' +
+          'Sent: ' + (post.created_at || '') +
+        '</div>';
+      item.onclick = function() {
+        selectedPost = post;
+        renderPostList(posts);
+        showPostEditor(post);
+      };
+      list.appendChild(item);
+    });
+    if (!selectedPost && posts.length) {
+      selectedPost = posts[0];
+      renderPostList(posts);
+      return;
+    }
+    showPostEditor(selectedPost);
+  }
+
+  function showPostEditor(post) {
+    var empty = document.getElementById('postEditorEmpty');
+    var editor = document.getElementById('postEditor');
+    if (!post) {
+      empty.style.display = 'block';
+      editor.style.display = 'none';
+      return;
+    }
+    empty.style.display = 'none';
+    editor.style.display = 'block';
+
+    var embed = post.embed || {};
+    document.getElementById('editPostId').value = post.id;
+    document.getElementById('editContent').value = post.content || '';
+    document.getElementById('editTitle').value = embed.title || '';
+    document.getElementById('editAuthor').value = (embed.author && embed.author.name) || '';
+    document.getElementById('editUrl').value = embed.url || '';
+    document.getElementById('editEmbedColor').value = embed.color ? '#' + Number(embed.color).toString(16).padStart(6, '0') : '#66C0F4';
+    document.getElementById('editDescription').value = embed.description || '';
+    document.getElementById('editFooter').value = (embed.footer && embed.footer.text) || '';
+    document.getElementById('openSourceLink').href = post.news_url || embed.url || '#';
+  }
+
+  function fetchDashboardData() {
+    return fetch('/api/discord-dashboard')
+      .then(function(resp) { return resp.json(); })
+      .then(function(data) {
+        loadIntoForms(data);
+        return data;
+      });
+  }
+
+  function saveDiscordConfig(section) {
+    var payload = {
+      discord: {
+        enabled: document.getElementById('alertsEnabled').checked,
+        webhook_urls: splitWebhookText(document.getElementById('alertsWebhooks').value)
+      },
+      discord_updates: {
+        enabled: document.getElementById('updatesEnabled').checked,
+        webhook_urls: splitWebhookText(document.getElementById('updatesWebhooks').value),
+        mention_text: document.getElementById('updatesMention').value.trim(),
+        title_prefix: document.getElementById('updatesPrefix').value.trim(),
+        embed_color: document.getElementById('updatesColor').value.trim(),
+        include_excerpt: document.getElementById('updatesIncludeExcerpt').checked,
+        excerpt_length: parseInt(document.getElementById('updatesExcerptLength').value, 10) || 3000,
+        include_author: document.getElementById('updatesIncludeAuthor').checked,
+        use_header_image: document.getElementById('updatesUseHeaderImage').checked,
+        post_existing: document.getElementById('updatesPostExisting').checked,
+        check_interval_minutes: parseInt(document.getElementById('updatesInterval').value, 10) || 15,
+        max_posts_per_check: parseInt(document.getElementById('updatesBurst').value, 10) || 3
+      }
+    };
+    var statusId = section === 'alerts' ? 'alertsStatus' : 'updatesStatus';
+    setStatus(statusId, 'info', 'Saving...');
+    fetch('/api/discord-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function(resp) { return resp.json(); })
+      .then(function(data) {
+        if (!data.success) throw new Error(data.error || 'Save failed');
+        setStatus(statusId, 'ok', 'Saved.');
+        return fetchDashboardData();
+      })
+      .catch(function(err) {
+        setStatus(statusId, 'err', err.message);
+      });
+  }
+
+  function previewLatestUpdatePost() {
+    var firstGame = (dashboardData && dashboardData.games && dashboardData.games[0]) || null;
+    if (!firstGame || !firstGame.app_id) {
+      setStatus('updatesStatus', 'err', 'No configured game found.');
+      return;
+    }
+    var payload = {
+      mode: 'latest',
+      app_id: firstGame.app_id,
+      game_name: firstGame.name || '',
+      discord_updates: {
+        enabled: document.getElementById('updatesEnabled').checked,
+        webhook_urls: splitWebhookText(document.getElementById('updatesWebhooks').value),
+        mention_text: document.getElementById('updatesMention').value.trim(),
+        title_prefix: document.getElementById('updatesPrefix').value.trim(),
+        embed_color: document.getElementById('updatesColor').value.trim(),
+        include_excerpt: document.getElementById('updatesIncludeExcerpt').checked,
+        excerpt_length: parseInt(document.getElementById('updatesExcerptLength').value, 10) || 3000,
+        include_author: document.getElementById('updatesIncludeAuthor').checked,
+        use_header_image: document.getElementById('updatesUseHeaderImage').checked,
+        post_existing: document.getElementById('updatesPostExisting').checked,
+        check_interval_minutes: parseInt(document.getElementById('updatesInterval').value, 10) || 15,
+        max_posts_per_check: parseInt(document.getElementById('updatesBurst').value, 10) || 3
+      }
+    };
+    if (!payload.discord_updates.webhook_urls.length) {
+      setStatus('updatesStatus', 'err', 'Add at least one update webhook first.');
+      return;
+    }
+    setStatus('updatesStatus', 'info', 'Posting latest Steam news preview...');
+    fetch('/api/test-news-alert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function(resp) { return resp.json(); })
+      .then(function(data) {
+        if (!data.success) throw new Error(data.message || data.error || 'Preview failed');
+        setStatus('updatesStatus', 'ok', data.message || 'Preview posted.');
+        return fetchDashboardData();
+      })
+      .catch(function(err) {
+        setStatus('updatesStatus', 'err', err.message);
+      });
+  }
+
+  function savePostEdit() {
+    var postId = parseInt(document.getElementById('editPostId').value, 10);
+    if (!postId) {
+      setStatus('postEditStatus', 'err', 'No post selected.');
+      return;
+    }
+    var embed = Object.assign({}, (selectedPost && selectedPost.embed) || {});
+    embed.title = document.getElementById('editTitle').value.trim();
+    embed.description = document.getElementById('editDescription').value;
+    embed.url = document.getElementById('editUrl').value.trim();
+    embed.color = parseInt((document.getElementById('editEmbedColor').value || '#66C0F4').replace('#', ''), 16);
+    embed.footer = Object.assign({}, embed.footer || {}, { text: document.getElementById('editFooter').value.trim() || 'SteamDash Discord edit' });
+    if (document.getElementById('editAuthor').value.trim()) {
+      embed.author = Object.assign({}, embed.author || {}, { name: document.getElementById('editAuthor').value.trim() });
+    } else {
+      delete embed.author;
+    }
+
+    setStatus('postEditStatus', 'info', 'Updating Discord message...');
+    fetch('/api/discord-post/edit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        id: postId,
+        content: document.getElementById('editContent').value,
+        embed: embed
+      })
+    }).then(function(resp) { return resp.json(); })
+      .then(function(data) {
+        if (!data.success) throw new Error(data.error || 'Discord update failed');
+        setStatus('postEditStatus', 'ok', data.message || 'Updated.');
+        return fetchDashboardData();
+      })
+      .catch(function(err) {
+        setStatus('postEditStatus', 'err', err.message);
+      });
+  }
+
+  function deletePostEdit() {
+    var postId = parseInt(document.getElementById('editPostId').value, 10);
+    if (!postId) {
+      setStatus('postEditStatus', 'err', 'No post selected.');
+      return;
+    }
+    if (!window.confirm('Delete this Discord message? This cannot be undone.')) {
+      return;
+    }
+    setStatus('postEditStatus', 'info', 'Deleting Discord message...');
+    fetch('/api/discord-post/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: postId })
+    }).then(function(resp) { return resp.json(); })
+      .then(function(data) {
+        if (!data.success) throw new Error(data.error || data.message || 'Delete failed');
+        selectedPost = null;
+        setStatus('postEditStatus', 'ok', data.message || 'Deleted.');
+        return fetchDashboardData();
+      })
+      .catch(function(err) {
+        setStatus('postEditStatus', 'err', err.message);
+      });
+  }
+
+  document.querySelectorAll('.tab').forEach(function(tab) {
+    tab.addEventListener('click', function() { switchTab(tab.getAttribute('data-tab')); });
+  });
+  document.getElementById('saveAlertsBtn').addEventListener('click', function() { saveDiscordConfig('alerts'); });
+  document.getElementById('saveUpdatesBtn').addEventListener('click', function() { saveDiscordConfig('updates'); });
+  document.getElementById('previewLatestUpdateBtn').addEventListener('click', previewLatestUpdatePost);
+  document.getElementById('refreshPostsBtn').addEventListener('click', fetchDashboardData);
+  document.getElementById('savePostEditBtn').addEventListener('click', savePostEdit);
+  document.getElementById('deletePostBtn').addEventListener('click', deletePostEdit);
+
+  fetchDashboardData().catch(function(err) {
+    setStatus('alertsStatus', 'err', err.message);
+  });
+})();
+</script>
+</body>
+</html>'''
 
 DASHBOARD_HTML_TEMPLATE = '''<!DOCTYPE html>
 <html lang="{{LANGUAGE}}">
@@ -2473,6 +4068,7 @@ body {
     <div class="update-time" id="lastUpdate">--</div>
     <div class="poll-info" data-i18n="pollInfo">5min poll</div>
     <div class="header-buttons">
+      <a class="settings-btn" href="/discord" title="Discord Dashboard">DC</a>
       <a class="settings-btn" href="/settings" title="Settings">\u2699</a>
     </div>
     <div class="game-selector" id="gameSelector"></div>
@@ -2561,6 +4157,7 @@ body {
   <span>Poll: {{POLL_INTERVAL}}s</span>
   <span>Telegram: <span class="dot" id="tgDot"></span> <span id="tgStatus"></span></span>
   <span>Discord: <span class="dot" id="dcDot"></span> <span id="dcStatus"></span></span>
+  <span>Updates: <span class="dot" id="dcNewsDot"></span> <span id="dcNewsStatus"></span></span>
 </div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -2880,6 +4477,8 @@ body {
       document.getElementById('tgStatus').textContent = data.telegram_active ? 'ON' : 'OFF';
       document.getElementById('dcDot').className = 'dot ' + (data.discord_active ? 'on' : 'off');
       document.getElementById('dcStatus').textContent = data.discord_active ? 'ON' : 'OFF';
+      document.getElementById('dcNewsDot').className = 'dot ' + (data.discord_updates_active ? 'on' : 'off');
+      document.getElementById('dcNewsStatus').textContent = data.discord_updates_active ? 'ON' : 'OFF';
       document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
       fetchFailCount = 0;
     }).catch(function(e) { console.error('Fetch error:', e); fetchFailCount++; });
@@ -2915,20 +4514,61 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return b''
 
     def _json_response(self, data, status=200):
-        self.send_response(status)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+        body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self._write_response(body, status, 'application/json')
 
     def _html_response(self, html):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self._write_response(html.encode('utf-8'), 200, 'text/html; charset=utf-8')
+
+    def _write_response(self, body, status, content_type):
+        try:
+            self.send_response(status)
+            self.send_header('Content-Type', content_type)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+            # Browsers can abort in-flight refreshes/navigation. Treat that as a benign disconnect.
+            return
+
+    def _discord_auth_guard(self, is_api=False):
+        settings = get_all_settings()
+        auth_cfg = settings.get('discord_dashboard_auth', DEFAULT_DISCORD_DASHBOARD_AUTH)
+        if not discord_dashboard_auth_configured(auth_cfg):
+            if is_api:
+                self._json_response({'success': False, 'error': 'Discord Dashboard auth is not configured. Set it in /settings.'}, 403)
+            else:
+                self.send_response(302)
+                self.send_header('Location', '/settings')
+                self.end_headers()
+            return True
+
+        auth_header = self.headers.get('Authorization', '')
+        if auth_header.startswith('Basic '):
+            try:
+                decoded = base64.b64decode(auth_header.split(' ', 1)[1]).decode('utf-8')
+                username, password = decoded.split(':', 1)
+            except Exception:
+                username, password = '', ''
+            if verify_discord_dashboard_auth(auth_cfg, username, password):
+                return False
+
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="SteamDash Discord Dashboard"')
+        self.send_header('Content-Type', 'application/json' if is_api else 'text/plain; charset=utf-8')
         self.end_headers()
-        self.wfile.write(html.encode('utf-8'))
+        try:
+            self.wfile.write((json.dumps({'success': False, 'error': 'Authentication required'}) if is_api else 'Authentication required').encode('utf-8'))
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+            pass
+        return True
 
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
+
+        if parsed.path == '/discord' or parsed.path.startswith('/api/discord'):
+            if self._discord_auth_guard(is_api=parsed.path.startswith('/api/')):
+                return
 
         if parsed.path in ('/', '/dashboard'):
             if not has_settings():
@@ -2942,11 +4582,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
             settings = get_all_settings()
             html = SETUP_HTML_TEMPLATE.replace(
                 '{{EXISTING_SETTINGS_JSON}}',
-                json.dumps(settings, ensure_ascii=False)
+                json.dumps(sanitize_settings_for_ui(settings), ensure_ascii=False)
             )
             dash = settings.get('dashboard', {})
             html = html.replace('{{PORT}}', str(dash.get('port', 8081)))
             self._html_response(html)
+
+        elif parsed.path == '/discord':
+            if not has_settings():
+                self.send_response(302)
+                self.send_header('Location', '/settings')
+                self.end_headers()
+                return
+            self._html_response(DISCORD_DASHBOARD_HTML_TEMPLATE)
 
         elif parsed.path == '/api/test':
             api_key = params.get('api_key', [''])[0]
@@ -3039,6 +4687,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
             tg = settings.get('telegram', {})
             dc = settings.get('discord', {})
+            dc_updates = settings.get('discord_updates', {})
 
             payload = {
                 "current_players": players,
@@ -3059,6 +4708,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "wishlist_by_country": gs.cached_wishlist_by_country,
                 "telegram_active": telegram_enabled(tg),
                 "discord_active": discord_enabled(dc),
+                "discord_updates_active": discord_updates_enabled(dc_updates),
                 "timestamp": datetime.now().isoformat()
             }
             self._json_response(payload)
@@ -3085,6 +4735,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 'type': alert_type
             }, status=status)
 
+        elif parsed.path == '/api/test-news-alert':
+            if not has_settings():
+                self._json_response({'success': False, 'error': 'Not configured'}, 503)
+                return
+
+            settings = get_all_settings()
+            app_id = params.get('app_id', [''])[0]
+            game = get_game_from_settings(settings, app_id)
+            if not game:
+                self._json_response({'success': False, 'error': 'No configured games found'}, 400)
+                return
+
+            success, message = send_test_news_alert(settings, game)
+            status = 200 if success else 400
+            self._json_response({
+                'success': success,
+                'message': message,
+                'app_id': str(game['app_id'])
+            }, status=status)
+
+        elif parsed.path == '/api/discord-dashboard':
+            if not has_settings():
+                self._json_response({'success': False, 'error': 'Not configured'}, 503)
+                return
+            self._json_response(get_discord_dashboard_payload())
+
         else:
             self.send_response(404)
             self.end_headers()
@@ -3092,12 +4768,103 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urlparse(self.path)
 
-        if parsed.path in ('/api/setup', '/api/settings'):
+        if parsed.path.startswith('/api/discord'):
+            if self._discord_auth_guard(is_api=True):
+                return
+
+        if parsed.path == '/api/test-news-alert':
             body = self._read_body()
             try:
                 data = json.loads(body.decode('utf-8'))
             except Exception:
                 self._json_response({'success': False, 'error': 'Invalid JSON'}, 400)
+                return
+
+            app_id = str(data.get('app_id', '')).strip()
+            if not app_id:
+                self._json_response({'success': False, 'error': 'Missing app_id'}, 400)
+                return
+
+            news_config = normalize_discord_updates_config(data.get('discord_updates', {}))
+            game = {
+                'app_id': app_id,
+                'name': str(data.get('game_name', '')).strip() or get_game_name_from_api(app_id)
+            }
+            mode = str(data.get('mode', 'test')).strip().lower()
+            handler = send_latest_news_preview if mode == 'latest' else send_test_news_alert
+            success, message = handler({'discord_updates': news_config}, game)
+            status = 200 if success else 400
+            self._json_response({'success': success, 'message': message, 'app_id': app_id}, status=status)
+
+        elif parsed.path == '/api/discord-config':
+            if not has_settings():
+                self._json_response({'success': False, 'error': 'Not configured'}, 503)
+                return
+            body = self._read_body()
+            try:
+                data = json.loads(body.decode('utf-8'))
+            except Exception:
+                self._json_response({'success': False, 'error': 'Invalid JSON'}, 400)
+                return
+
+            settings = get_all_settings()
+            settings['discord'] = normalize_discord_config(data.get('discord', settings.get('discord', {})))
+            settings['discord_updates'] = normalize_discord_updates_config(data.get('discord_updates', settings.get('discord_updates', {})))
+            save_all_settings(settings)
+            self.server.dashboard_html = build_dashboard_html()
+            self._json_response({'success': True})
+
+        elif parsed.path == '/api/discord-post/edit':
+            if not has_settings():
+                self._json_response({'success': False, 'error': 'Not configured'}, 503)
+                return
+            body = self._read_body()
+            try:
+                data = json.loads(body.decode('utf-8'))
+            except Exception:
+                self._json_response({'success': False, 'error': 'Invalid JSON'}, 400)
+                return
+
+            post_id = parse_int(data.get('id'), 0)
+            embed = dict(data.get('embed') or {})
+            if not post_id:
+                self._json_response({'success': False, 'error': 'Missing post id'}, 400)
+                return
+            success, message = edit_discord_update_message(post_id, data.get('content', ''), embed)
+            status = 200 if success else 400
+            self._json_response({'success': success, 'message': message}, status=status)
+
+        elif parsed.path == '/api/discord-post/delete':
+            if not has_settings():
+                self._json_response({'success': False, 'error': 'Not configured'}, 503)
+                return
+            body = self._read_body()
+            try:
+                data = json.loads(body.decode('utf-8'))
+            except Exception:
+                self._json_response({'success': False, 'error': 'Invalid JSON'}, 400)
+                return
+
+            post_id = parse_int(data.get('id'), 0)
+            if not post_id:
+                self._json_response({'success': False, 'error': 'Missing post id'}, 400)
+                return
+            success, message = delete_discord_update_message(post_id)
+            status = 200 if success else 400
+            self._json_response({'success': success, 'message': message}, status=status)
+
+        elif parsed.path in ('/api/setup', '/api/settings'):
+            body = self._read_body()
+            try:
+                data = json.loads(body.decode('utf-8'))
+            except Exception:
+                self._json_response({'success': False, 'error': 'Invalid JSON'}, 400)
+                return
+
+            existing_auth = get_all_settings().get('discord_dashboard_auth', DEFAULT_DISCORD_DASHBOARD_AUTH) if has_settings() else DEFAULT_DISCORD_DASHBOARD_AUTH
+            auth_candidate = build_discord_dashboard_auth_config(data.get('discord_dashboard_auth', {}), existing_auth)
+            if not discord_dashboard_auth_configured(auth_candidate):
+                self._json_response({'success': False, 'error': 'Discord Dashboard username and password are required.'}, 400)
                 return
 
             # Auto-fetch game names for any game missing a name
@@ -3164,10 +4931,13 @@ def main():
         games = settings.get('games', [])
         tg = settings.get('telegram', {})
         dc = settings.get('discord', {})
+        dc_updates = settings.get('discord_updates', {})
         tg_on = telegram_enabled(tg)
         dc_on = discord_enabled(dc)
+        dc_updates_on = discord_updates_enabled(dc_updates)
         tg_count = len(tg.get('chat_ids', [])) if tg_on else 0
         dc_count = len(dc.get('webhook_urls', [])) if dc_on else 0
+        dc_updates_count = len(dc_updates.get('webhook_urls', [])) if dc_updates_on else 0
 
         # Fetch first game name for banner
         game_name = games[0].get('name', games[0]['app_id']) if games else 'No games'
@@ -3182,6 +4952,7 @@ def main():
         print(f"  Polling:    {dash.get('poll_interval', 300) // 60}min")
         print(f"  Telegram:   {'ON (' + str(tg_count) + ' recipients)' if tg_on else 'OFF'}")
         print(f"  Discord:    {'ON (' + str(dc_count) + ' webhooks)' if dc_on else 'OFF'}")
+        print(f"  DC Updates: {'ON (' + str(dc_updates_count) + ' webhooks)' if dc_updates_on else 'OFF'}")
         print(f"  Theme:      {dash.get('theme', 'dark')} / {dash.get('accent', 'steam')}")
         print(f"  Language:   {dash.get('language', 'en')}")
         print("=" * 50)

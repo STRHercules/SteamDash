@@ -15,6 +15,26 @@
     "webhook_urls": []
   },
 
+  "discord_updates": {
+    "enabled": false,
+    "webhook_urls": [],
+    "mention_text": "",
+    "title_prefix": "[Steam Update]",
+    "embed_color": "#66C0F4",
+    "include_excerpt": true,
+    "excerpt_length": 280,
+    "include_author": true,
+    "use_header_image": true,
+    "post_existing": false,
+    "check_interval_minutes": 15,
+    "max_posts_per_check": 3
+  },
+
+  "discord_dashboard_auth": {
+    "username": "admin",
+    "password": "change-me"
+  },
+
   "dashboard": {
     "port": 8081,
     "poll_interval": 300,
