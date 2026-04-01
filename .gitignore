@@ -1,0 +1,6 @@
+dashboard.db
+config.json
+__pycache__/
+*.pyc
+.DS_Store
+steam_dashboard.db

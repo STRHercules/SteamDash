@@ -1,0 +1,25 @@
+{
+  "steam_api_key": "YOUR_STEAM_API_KEY",
+  "steam_financial_key": "YOUR_STEAM_FINANCIAL_KEY",
+  "app_id": "YOUR_APP_ID",
+  "launch_date": "2025-01-01",
+
+  "telegram": {
+    "enabled": false,
+    "bot_token": "",
+    "chat_ids": []
+  },
+
+  "discord": {
+    "enabled": false,
+    "webhook_urls": []
+  },
+
+  "dashboard": {
+    "port": 8081,
+    "poll_interval": 300,
+    "language": "en",
+    "theme": "dark",
+    "accent": "wine"
+  }
+}
