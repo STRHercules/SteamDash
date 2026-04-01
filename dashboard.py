@@ -521,6 +521,7 @@ def delete_discord_update_post(post_id):
 # ========== HTTP FETCH WITH BACKOFF ==========
 
 _api_fail_counts = {}
+_steam_news_rich_cache = {}
 
 
 def fetch_json(url, label="api"):
@@ -538,6 +539,24 @@ def fetch_json(url, label="api"):
         print(f"  [ERROR] {label}: {e} (backoff {wait}s)")
         time.sleep(wait)
         return None
+
+
+def fetch_text(url, label="api_text"):
+    global _api_fail_counts
+    try:
+        req = Request(url, headers={"User-Agent": "SteamDashboard/1.0"})
+        with urlopen(req, timeout=15) as resp:
+            data = resp.read().decode('utf-8', 'replace')
+            final_url = resp.geturl()
+        _api_fail_counts[label] = 0
+        return data, final_url
+    except Exception as e:
+        count = _api_fail_counts.get(label, 0) + 1
+        _api_fail_counts[label] = count
+        wait = min(2 ** count, 60)
+        print(f"  [ERROR] {label}: {e} (backoff {wait}s)")
+        time.sleep(wait)
+        return None, url
 
 
 def post_json(url, payload, label="api_post"):
@@ -645,6 +664,109 @@ def fetch_steam_news(app_id, count=100):
     return []
 
 
+def parse_steam_news_event_gid(url):
+    match = re.search(r'/(?:view|detail)/(\d+)', str(url or ''))
+    return match.group(1) if match else ''
+
+
+def decode_json_string(value):
+    raw = str(value or '')
+    try:
+        return json.loads(f'"{raw}"')
+    except Exception:
+        return raw.replace('\\"', '"').replace('\\\\', '\\')
+
+
+def iter_steam_announcement_entries(page_html):
+    text = html.unescape(str(page_html or ''))
+    pattern = re.compile(
+        r'"gid":"(?P<event_gid>\d+)".*?'
+        r'"event_name":"(?P<event_name>(?:\\.|[^"\\])*)".*?'
+        r'"announcement_body":\{'
+        r'"gid":"(?P<body_gid>\d+)".*?'
+        r'"headline":"(?P<headline>(?:\\.|[^"\\])*)".*?'
+        r'"body":"(?P<body>(?:\\.|[^"\\])*)"',
+        flags=re.DOTALL
+    )
+
+    for match in pattern.finditer(text):
+        yield {
+            "event_gid": decode_json_string(match.group('event_gid')),
+            "body_gid": decode_json_string(match.group('body_gid')),
+            "event_name": decode_json_string(match.group('event_name')),
+            "headline": decode_json_string(match.group('headline')),
+            "body": decode_json_string(match.group('body'))
+        }
+
+
+def normalize_news_title(value):
+    return re.sub(r'\s+', ' ', html.unescape(str(value or ''))).strip().casefold()
+
+
+def fetch_rich_steam_news(news_item):
+    global _steam_news_rich_cache
+
+    url = str(news_item.get('url') or '').strip()
+    if not url:
+        return {"body": "", "url": ""}
+
+    cached = _steam_news_rich_cache.get(url)
+    if cached is not None:
+        return dict(cached)
+
+    feed_name = str(news_item.get('feedname') or '').strip().lower()
+    feed_label = str(news_item.get('feedlabel') or '').strip().lower()
+    rich_news = {"body": "", "url": url}
+    is_community_announcement = (
+        'steam_community_announcements' in feed_name or
+        'community announcements' in feed_label or
+        '/announcements/' in url or
+        '/externalpost/' in url
+    )
+
+    if not is_community_announcement:
+        _steam_news_rich_cache[url] = dict(rich_news)
+        return rich_news
+
+    label_hash = hashlib.sha1(url.encode('utf-8')).hexdigest()[:10]
+    page_html, final_url = fetch_text(url, f"news_html_{label_hash}")
+    if not page_html:
+        _steam_news_rich_cache[url] = dict(rich_news)
+        return rich_news
+
+    rich_news["url"] = final_url or url
+    target_gid = parse_steam_news_event_gid(final_url) or parse_steam_news_event_gid(url)
+    normalized_title = normalize_news_title(news_item.get('title'))
+
+    entries = list(iter_steam_announcement_entries(page_html))
+    if not entries:
+        _steam_news_rich_cache[url] = dict(rich_news)
+        return rich_news
+
+    candidates = entries
+    if target_gid:
+        gid_matches = [
+            entry for entry in candidates
+            if entry.get("event_gid") == target_gid or entry.get("body_gid") == target_gid
+        ]
+        if gid_matches:
+            candidates = gid_matches
+
+    if normalized_title:
+        title_matches = [
+            entry for entry in candidates
+            if normalize_news_title(entry.get("event_name")) == normalized_title
+            or normalize_news_title(entry.get("headline")) == normalized_title
+        ]
+        if title_matches:
+            candidates = title_matches
+
+    best = max(candidates, key=lambda entry: len(str(entry.get("body") or '').strip()))
+    rich_news["body"] = str(best.get("body") or '').strip()
+    _steam_news_rich_cache[url] = dict(rich_news)
+    return rich_news
+
+
 def clean_steam_news_text(value):
     text = html.unescape(str(value or ''))
     text = re.sub(r'\r\n?', '\n', text)
@@ -657,23 +779,28 @@ def clean_steam_news_text(value):
     text = re.sub(r'(?i)</h[1-6]>', '\n', text)
 
     text = re.sub(r'\[url=[^\]]+\](.*?)\[/url\]', r'\1', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'\[url\](.*?)\[/url\]', r'\1', text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'\[(?:img|previewyoutube)[^\]]*\].*?\[/(?:img|previewyoutube)\]', ' ', text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'\[h[1-6][^\]]*\](.*?)\[/h[1-6]\]', lambda m: f"\n\n{m.group(1).strip()}\n", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'\[b[^\]]*\](.*?)\[/b\]', lambda m: f"**{m.group(1).strip()}**", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'\[i[^\]]*\](.*?)\[/i\]', lambda m: f"*{m.group(1).strip()}*", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r'\[u[^\]]*\](.*?)\[/u\]', lambda m: f"__{m.group(1).strip()}__", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'\[/?p[^\]]*\]', '\n\n', text, flags=re.IGNORECASE)
     text = re.sub(r'\[list[^\]]*\]', '\n', text, flags=re.IGNORECASE)
     text = re.sub(r'\[/list\]', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[/?(?:o?list|u?list)[^\]]*\]', '\n', text, flags=re.IGNORECASE)
     text = re.sub(r'\[\*\]', '\n* ', text, flags=re.IGNORECASE)
-    text = re.sub(r'\[/?(?:quote|code)[^\]]*\]', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[/\*\]', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[/?(?:quote|code|spoiler|table|tr|td)[^\]]*\]', '\n', text, flags=re.IGNORECASE)
+    text = re.sub(r'\[/?(?:img|previewyoutube)[^\]]*\]', ' ', text, flags=re.IGNORECASE)
     text = re.sub(r'<[^>]+>', '', text)
     text = re.sub(r'[ \t]{2,}', ' ', text)
 
     # Steam sometimes delivers community announcements already flattened into:
     # "v0.9.x * bullet * bullet v0.10.x * bullet ..."
     text = re.sub(r'(?<!^)(?<!\n)(\b[vV]\d+(?:\.\d+)*(?:\.x)?\b)(?=\s+\*)', r'\n\n\1', text)
-    text = re.sub(r'\s+\*\s+', '\n* ', text)
-    text = re.sub(r'(?<!\n)\*\s+', '\n* ', text)
+    text = re.sub(r'(?<!\*)\s+\*(?!\*)\s+', '\n* ', text)
+    text = re.sub(r'(?<![\n\*])\*(?!\*)\s+', '\n* ', text)
 
     lines = []
     for raw_line in text.split('\n'):
@@ -709,8 +836,8 @@ def truncate_text_preserving_format(value, limit):
 
     if kept:
         truncated = '\n\n'.join(kept).rstrip()
-        if len(truncated) < len(text):
-            return truncated + '\n…'
+        if len(truncated) < len(text) and current_len >= max(80, limit // 3):
+            return truncated + '\n...'
 
     clipped = text[:max(0, limit - 1)].rstrip()
     last_newline = clipped.rfind('\n')
@@ -718,7 +845,7 @@ def truncate_text_preserving_format(value, limit):
         clipped = clipped[:last_newline].rstrip()
     elif ' ' in clipped:
         clipped = clipped.rsplit(' ', 1)[0].rstrip()
-    return clipped + '…'
+    return clipped + '...'
 
 
 def truncate_text(value, limit):
@@ -728,7 +855,7 @@ def truncate_text(value, limit):
     clipped = text[:max(0, limit - 1)].rstrip()
     if ' ' in clipped:
         clipped = clipped.rsplit(' ', 1)[0]
-    return clipped.rstrip('.,;: ') + '…'
+    return clipped.rstrip('.,;: ') + '...'
 
 
 def split_text_preserving_format(value, limit):
@@ -1043,11 +1170,13 @@ def build_discord_news_embeds(app_id, game_name, news_item, news_config, app_det
         title = f"{title_prefix} {title}"
     version = extract_version_from_news_title(raw_title)
 
-    excerpt = clean_steam_news_text(news_item.get('contents', ''))
+    rich_news = fetch_rich_steam_news(news_item)
+    excerpt_source = rich_news.get('body') or news_item.get('contents', '')
+    excerpt = clean_steam_news_text(excerpt_source)
     description_parts = []
     if news_config.get('include_excerpt') and excerpt:
         max_excerpt_len = min(parse_int(news_config.get('excerpt_length'), 280), 12000)
-        excerpt = excerpt[:max_excerpt_len].strip() if len(excerpt) > max_excerpt_len else excerpt
+        excerpt = truncate_text_preserving_format(excerpt, max_excerpt_len)
         description_parts = split_text_preserving_format(excerpt, 4000)
 
     if not description_parts:
@@ -1059,7 +1188,7 @@ def build_discord_news_embeds(app_id, game_name, news_item, news_config, app_det
     for idx, part in enumerate(description_parts, start=1):
         embed = {
             "title": title if total_parts == 1 else (title if idx == 1 else f"{title} (cont. {idx}/{total_parts})"),
-            "url": news_item.get('url') or f"https://store.steampowered.com/app/{app_id}/",
+            "url": rich_news.get('url') or news_item.get('url') or f"https://store.steampowered.com/app/{app_id}/",
             "color": int(news_config.get('embed_color', '#66C0F4').lstrip('#'), 16),
             "timestamp": datetime.utcfromtimestamp(parse_int(news_item.get('date'), int(time.time()))).isoformat() + "Z",
             "footer": {"text": f"{game_name} Steam news" if total_parts == 1 else f"{game_name} Steam news • part {idx}/{total_parts}"},
