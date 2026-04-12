@@ -4,9 +4,7 @@
 
 [![Python 3.8+](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/chihyunn)
-
-**English** | [한국어](README_KO.md)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-ea4aaa.svg)](https://github.com/sponsors/STRHercules)
 
 ![Dashboard](screenshots/dashboard.png)
 
@@ -82,6 +80,40 @@ This is the one that's hard to find. It accesses sales, revenue, and wishlist da
 7. Copy the key — it starts with a long hex string
 
 > **Note:** You need "View Financial Info" permission in your Steamworks group to access this key. If you don't see the Web API Key option, ask your group admin for access.
+
+## Discord Setup (Optional)
+
+Get notified in your Discord server when someone buys your game, leaves a review, or when your game hits a milestone. Plus, access a specialized Discord-themed dashboard!
+
+### Step 1: Create a Webhook
+
+To receive alerts and daily summaries in Discord, you'll need a webhook.
+1. Right-click the Discord channel you want notifications in and select **Edit Channel**.
+2. Go to **Integrations** > **Webhooks** and click **New Webhook**.
+3. Give it a name (e.g., "Steam Alerts") and copy the **Webhook URL**.
+4. You can create separate webhooks for alerts and daily announcements, or use the same URL for both.
+
+### Step 2: Configure in Settings
+
+1. Open your Steam Dashboard settings (`http://localhost:8081/settings`).
+2. Paste your Webhook URLs into the Discord Notifications section.
+3. To enable the `/discord` dashboard view, set up a **Dashboard Auth** username and password.
+
+### Step 3: Enjoy Notifications and the Discord Dashboard
+
+Once configured, the background monitor will automatically push events to your Discord server.
+To view the Discord-styled mini dashboard, simply visit `<your-server-url>/discord` and log in with your configured credentials!
+
+### What You'll Get
+
+| Discord Dashboard | Announcements | Alerts |
+|:---:|:---:|:---:|
+| ![Discord Dash](screenshots/DiscordDash.png) | ![Announce](screenshots/DiscordAnnounce.png) | ![Alerts](screenshots/DiscordAlerts.png) |
+
+- Real-time sale alerts and review notifications
+- Daily sales and revenue summaries
+- Player count spike and wishlist milestone alerts
+- A sleek, Discord-styled dashboard view
 
 ## Telegram Setup (Optional)
 
@@ -213,7 +245,4 @@ Before submitting a PR:
 
 MIT
 
----
-
-Built with coffee by an indie game developer.
-If this saves you from refreshing Steamworks, [consider sponsoring](https://github.com/sponsors/chihyunn).
+[Original Credit](https://github.com/chihyunn)

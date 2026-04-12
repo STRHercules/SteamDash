@@ -4520,10 +4520,10 @@ body {
       var s = data.sales_totals || {};
       var suffix = T('unitSuffix');
       document.getElementById('totalSales').textContent = (s.units || 0).toLocaleString();
-      document.getElementById('salesSub').textContent = T('refunds') + ' ' + (s.returns || 0) + suffix + ' \u00B7 ' + T('grossLabel') + ' $' + (s.gross || 0).toFixed(0);
+      document.getElementById('salesSub').textContent = T('refunds') + ': ' + Math.abs(s.returns || 0) + ' \u00B7 ' + T('grossLabel') + ' $' + (s.gross || 0).toFixed(0);
       document.getElementById('netRevenue').textContent = '$' + (s.net || 0).toLocaleString(undefined, {minimumFractionDigits: 0, maximumFractionDigits: 0});
       document.getElementById('revenueSub').textContent = T('beforeFees') + ' $' + (s.gross || 0).toFixed(0);
-      document.getElementById('refundRate').textContent = (s.units > 0 ? ((s.returns / s.units) * 100).toFixed(1) : '0') + '%';
+      document.getElementById('refundRate').textContent = (s.units > 0 ? (Math.abs(s.returns / s.units) * 100).toFixed(1) : '0') + '%';
 
       var dailyForCum = (data.daily_sales || []).filter(function(r) { return r[1] !== 0 || r[2] !== 0 || r[4] !== 0; });
       var cumUnits = 0, cumNet = 0;
