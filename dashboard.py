@@ -80,6 +80,10 @@ def init_db():
         app_id TEXT, timestamp TEXT, total_units INTEGER, total_returns INTEGER,
         total_net_usd REAL, PRIMARY KEY (app_id, timestamp)
     )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS alert_state (
+        app_id TEXT PRIMARY KEY,
+        last_sale_alert_total INTEGER NOT NULL DEFAULT 0
+    )''')
     c.execute('''CREATE TABLE IF NOT EXISTS wishlist_history (
         app_id TEXT, timestamp TEXT, total_adds INTEGER, total_deletes INTEGER,
         total_purchases INTEGER, net_wishlists INTEGER
@@ -391,6 +395,66 @@ def get_sales_totals(app_id):
     row = conn.execute("SELECT COALESCE(SUM(units_sold),0), COALESCE(SUM(units_returned),0), COALESCE(SUM(gross_revenue_usd),0), COALESCE(SUM(net_revenue_usd),0) FROM daily_sales WHERE app_id=?", (str(app_id),)).fetchone()
     conn.close()
     return row
+
+
+def seed_sale_alert_total(app_id, total_units):
+    observed_total = max(0, parse_int(total_units, 0))
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT last_sale_alert_total FROM alert_state WHERE app_id=?",
+            (str(app_id),)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO alert_state (app_id, last_sale_alert_total) VALUES (?, ?)",
+                (str(app_id), observed_total)
+            )
+        else:
+            existing_total = max(0, parse_int(row[0], 0))
+            if observed_total > existing_total:
+                conn.execute(
+                    "UPDATE alert_state SET last_sale_alert_total=? WHERE app_id=?",
+                    (observed_total, str(app_id))
+                )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def claim_sale_alert_delta(app_id, total_units):
+    observed_total = max(0, parse_int(total_units, 0))
+    conn = get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT last_sale_alert_total FROM alert_state WHERE app_id=?",
+            (str(app_id),)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                "INSERT INTO alert_state (app_id, last_sale_alert_total) VALUES (?, ?)",
+                (str(app_id), observed_total)
+            )
+            conn.commit()
+            return None
+
+        previous_total = max(0, parse_int(row[0], 0))
+        if observed_total <= previous_total:
+            conn.commit()
+            return None
+
+        updated = conn.execute(
+            "UPDATE alert_state SET last_sale_alert_total=? WHERE app_id=? AND last_sale_alert_total=?",
+            (observed_total, str(app_id), previous_total)
+        )
+        conn.commit()
+        if updated.rowcount == 1:
+            return previous_total
+        return None
+    finally:
+        conn.close()
 
 
 def get_news_state(app_id):
@@ -1770,6 +1834,7 @@ class DataCollector:
                 gs.last_player_count = players
                 gs.last_review_count = total_reviews
                 gs.last_total_units = total_units
+                seed_sale_alert_total(app_id, total_units)
                 print(f"  [{game_name}] Baseline: units={total_units}, wl={wl_net}, reviews={total_reviews}, players={players}")
                 continue
 
@@ -1848,8 +1913,10 @@ class DataCollector:
                 notify_channels(tg, dc, telegram_message=review_msg, discord_embed=review_embed)
 
             # New sale
-            if gs.last_total_units > 0 and total_units > gs.last_total_units:
-                new_sales = total_units - gs.last_total_units
+            previous_alert_total = claim_sale_alert_delta(app_id, total_units)
+            baseline_units = max(gs.last_total_units, previous_alert_total or 0)
+            if previous_alert_total is not None and total_units > baseline_units:
+                new_sales = total_units - baseline_units
                 country_lines = ""
                 top_country_field = "No country breakdown yet."
                 if gs.cached_sales_by_country:
